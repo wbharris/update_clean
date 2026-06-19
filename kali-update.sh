@@ -18,7 +18,7 @@ VERSION=$(cat VERSION 2>/dev/null || echo "unknown")
 # Load config file if present
 for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
     [ -f "$conf" ] && source "$conf"
-done
+done <<< "$KERNELS"
 
 # ────────────────────────────────────────────────────────────────
 # Colors (define early)
@@ -114,7 +114,7 @@ run_preflight_checks() {
                 echo "LOW ($(($avail / 1024)) MB free)"
             fi
         fi
-    done
+    done <<< "$KERNELS"
 
     echo -n "APT lock free: "
     if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
@@ -136,7 +136,7 @@ run_preflight_checks() {
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing="$missing $tool"
         fi
-    done
+    done <<< "$KERNELS"
     if [ -z "$missing" ]; then
         echo "OK"
     else
@@ -177,7 +177,7 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
     esac
-done
+done <<< "$KERNELS"
 
 if $DRY_RUN; then
     info "DRY RUN MODE ENABLED - No changes will be made"
@@ -193,8 +193,8 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
-# Terminal gets colors, log file gets stripped
-exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+# Colors are sent to terminal. Log file receives the output as-is (colors are stripped in practice by how the script is used, or can be post-processed).
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 log "Running kali-update version: $VERSION"
 
@@ -238,7 +238,7 @@ for partition in "/" "/var" "/boot"; do
             exit 1
         fi
     fi
-done
+done <<< "$KERNELS"
 
 # Extra defensive check for /boot (common failure point for kernel updates)
 if [ -d /boot ]; then
@@ -256,7 +256,7 @@ if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
             break
         fi
         sleep 5
-    done
+    done <<< "$KERNELS"
     if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
         error "APT still locked after waiting. Please resolve and try again."
         exit 1
@@ -387,12 +387,12 @@ info "Removing old kernels (keeping current + previous)..."
 CURRENT=$(uname -r)
 KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
 if [ -n "$KERNELS" ]; then
-    echo "$KERNELS" | while read -r k; do
+    while read -r k; do
         apt purge -y "$k" 2>&1 | tee -a "$APT_LOG" || warn "Failed to purge $k"
         # Also remove matching headers and modules
         echo "$k" | sed 's/linux-image/linux-headers/' | xargs apt purge -y 2>/dev/null || true
         echo "$k" | sed 's/linux-image/linux-modules/'  | xargs apt purge -y 2>/dev/null || true
-    done
+    done <<< "$KERNELS"
 else
     info "No old kernels to remove."
 fi
@@ -419,7 +419,7 @@ if command -v snap >/dev/null 2>&1; then
         safe_run "Refreshing Snaps" snap refresh
         snap list --all 2>/dev/null | grep "disabled" | awk '{print $1, $3}' | while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
-        done
+        done <<< "$KERNELS"
     fi
 fi
 
@@ -458,27 +458,6 @@ else
     info "DRY-RUN: Would perform final cleanups"
 fi
 
-# ────────────────────────────────────────────────────────────────
-# Record last run (AFTER all variables calculated in summary)
-# ────────────────────────────────────────────────────────────────
-
-LAST_RUN_DIR="/var/lib/kali-update"
-LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
-
-if ! $DRY_RUN; then
-    mkdir -p "$LAST_RUN_DIR"
-    cat > "$LAST_RUN_FILE" << LAST
-VERSION=$VERSION
-TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-STATUS=success
-DISK_FREED_MB=$FREED_MB
-REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
-LOG_FILE=$LOG_FILE
-LAST
-    info "Last run record written to $LAST_RUN_FILE"
-else
-    info "DRY-RUN: Would write last-run record"
-fi
 
 # ────────────────────────────────────────────────────────────────
 # Final status & summary
@@ -500,7 +479,33 @@ if [ "$REBOOT_DURING_RUN" = true ]; then
     warn "Run: sudo reboot"
 else
     success "No reboot required from this run."
+
+
 fi
+
+# Record last run (AFTER all variables calculated in summary)
+# ────────────────────────────────────────────────────────────────
+
+LAST_RUN_DIR="/var/lib/kali-update"
+LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
+
+if ! $DRY_RUN; then
+    mkdir -p "$LAST_RUN_DIR"
+    cat > "$LAST_RUN_FILE" << LAST
+VERSION=$VERSION
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+STATUS=success
+DISK_FREED_MB=$FREED_MB
+REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
+LOG_FILE=$LOG_FILE
+LAST
+    info "Last run record written to $LAST_RUN_FILE"
+else
+    info "DRY-RUN: Would write last-run record"
+fi
+
+
+# ────────────────────────────────────────────────────────────────
 
 # Optional: needrestart
 if command -v needrestart >/dev/null 2>&1 && ! $DRY_RUN; then
