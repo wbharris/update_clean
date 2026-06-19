@@ -406,7 +406,7 @@ if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     notify-send "Kali Update" "$MSG" 2>/dev/null || true
 fi
 
-success "Kali update and cleanup completed successfully!"
+if $DRY_RUN; then success "Kali update and cleanup simulation completed (dry-run)."; else success "Kali update and cleanup completed successfully!"; fi
 log "=== Update Summary ==="
 log "Disk space freed: ${FREED_MB} MB"
 log "Full log saved to: $LOG_FILE"
