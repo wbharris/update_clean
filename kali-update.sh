@@ -267,7 +267,7 @@ fi
 # Remove old kernels (keep current + previous one) - fixed logic
 info "Removing old kernels (keeping current + previous)..."
 CURRENT=$(uname -r)
-KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | tail -n +2 || true)
+KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
 if [ -n "$KERNELS" ]; then
     echo "$KERNELS" | while read -r k; do
         apt purge -y "$k" 2>&1 | tee -a "$APT_LOG" || warn "Failed to purge $k"
