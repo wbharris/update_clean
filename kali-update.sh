@@ -39,6 +39,7 @@ mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
 exec > >(tee -a "$LOG_FILE") 2>&1
+log "Running kali-update version: $VERSION"
 
 log()      { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -64,7 +65,7 @@ Environment:
 USAGE
 }
 
-VERSION="5.7"
+VERSION="5.8"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
