@@ -38,14 +38,86 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
+# Redirect all output
 exec > >(tee -a "$LOG_FILE") 2>&1
-log "Running kali-update version: $VERSION"
 
 log()      { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
 success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 error()    { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Keep only the last N log files
+log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
+find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\n' \
+    | sort -n | head -n "-$LOG_RETENTION" | cut -d' ' -f2- | xargs -r rm -f
+
+# Record start time for upgrade validation
+SCRIPT_START=$(date +%s)
+
+# ────────────────────────────────────────────────────────────────
+# Environment
+# ────────────────────────────────────────────────────────────────
+export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+
+# ────────────────────────────────────────────────────────────────
+# Pre-flight checks
+# ────────────────────────────────────────────────────────────────
+
+if [ "$EUID" -ne 0 ]; then
+    error "This script must be run as root (use sudo)."
+    exit 1
+fi
+
+info "Checking internet connectivity..."
+if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    error "No internet connection detected."
+    exit 1
+fi
+
+# Check disk space on critical partitions
+for partition in "/" "/var" "/boot"; do
+    if [ -d "$partition" ]; then
+        avail_kb=$(df "$partition" --output=avail | tail -n 1)
+        if [ "$avail_kb" -lt 2097152 ]; then
+            error "Less than 2 GB free on $partition"
+            exit 1
+        fi
+    fi
+done
+
+# Check for APT lock
+if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
+    warn "APT is locked by another process. Waiting up to 60s..."
+    for i in {1..12}; do
+        if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
+            break
+        fi
+        sleep 5
+    done
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
+        error "APT still locked after waiting. Please resolve and try again."
+        exit 1
+    fi
+fi
+
+if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    warn "systemd-resolved is not active. DNS resolution may be affected."
+fi
+
+# Record disk before
+BEFORE=$(df / --output=used | tail -1)
+
+# ────────────────────────────────────────────────────────────────
+# Simple file lock
+# ────────────────────────────────────────────────────────────────
+LOCKFILE="/var/run/kali-update.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    error "Another instance of kali-update is already running."
+    exit 1
+fi
 
 # ────────────────────────────────────────────────────────────────
 # CLI Parsing
@@ -60,8 +132,9 @@ Options:
   --help, -h      Show this help
   --version, -v   Show version
 
-Environment:
+Environment / Config:
   LOG_RETENTION   Number of logs to keep (default: 3)
+  Can be set in /etc/kali-update.conf or environment.
 USAGE
 }
 
@@ -97,74 +170,8 @@ if $DRY_RUN; then
     info "DRY RUN MODE ENABLED - No changes will be made"
 fi
 
-# Keep only the last N log files
-log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
-find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\n' \
-    | sort -n | head -n "-$LOG_RETENTION" | cut -d' ' -f2- | xargs -r rm -f
-
-SCRIPT_START=$(date +%s)
-
-export DEBIAN_FRONTEND=noninteractive
-export APT_LISTCHANGES_FRONTEND=none
-
 # ────────────────────────────────────────────────────────────────
-# Pre-flight checks
-# ────────────────────────────────────────────────────────────────
-
-if [ "$EUID" -ne 0 ]; then
-    error "This script must be run as root (use sudo)."
-    exit 1
-fi
-
-info "Checking internet connectivity..."
-if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-    error "No internet connection detected."
-    exit 1
-fi
-
-for partition in "/" "/var" "/boot"; do
-    if [ -d "$partition" ]; then
-        avail_kb=$(df "$partition" --output=avail | tail -n 1)
-        if [ "$avail_kb" -lt 2097152 ]; then
-            error "Less than 2 GB free on $partition"
-            exit 1
-        fi
-    fi
-done
-
-# APT lock check
-if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-    warn "APT is locked by another process. Waiting up to 60s..."
-    for i in {1..12}; do
-        if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-            break
-        fi
-        sleep 5
-    done
-    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-        error "APT still locked after waiting."
-        exit 1
-    fi
-fi
-
-if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    warn "systemd-resolved is not active."
-fi
-
-BEFORE=$(df / --output=used | tail -1)
-
-# ────────────────────────────────────────────────────────────────
-# Simple file lock
-# ────────────────────────────────────────────────────────────────
-LOCKFILE="/var/run/kali-update.lock"
-exec 200>"$LOCKFILE"
-if ! flock -n 200; then
-    error "Another instance of kali-update is already running."
-    exit 1
-fi
-
-# ────────────────────────────────────────────────────────────────
-# Helper
+# Helper for non-critical steps
 # ────────────────────────────────────────────────────────────────
 safe_run() {
     local desc="$1"; shift
@@ -199,10 +206,10 @@ if [ -f "$KEYRING_ASC_PATH" ] && [ -f "$KEYRING_PATH" ]; then
         if gpg --verify "$KEYRING_ASC_PATH" "$KEYRING_PATH" >/dev/null 2>&1; then
             info "Keyring signature verified successfully"
         else
-            warn "Keyring signature verification failed — using anyway"
+            warn "Keyring signature verification failed — using anyway (may cause issues)"
         fi
     else
-        warn "gpg not installed, skipping signature verification"
+        warn "gpg not installed, skipping signature verification (install gnupg for better security)"
     fi
     rm -f "$KEYRING_ASC_PATH"
 fi
@@ -242,7 +249,8 @@ apt full-upgrade $APT_OPTS 2>&1 | tee -a "$APT_LOG" || warn "full-upgrade had is
 # Complete cleanup
 # ────────────────────────────────────────────────────────────────
 
-info "Holding critical packages..."
+# Protect critical packages
+info "Holding critical packages to prevent accidental removal..."
 apt-mark hold base-files base-passwd bash coreutils util-linux linux-image-$(uname -r) 2>/dev/null || true
 
 if $DRY_RUN; then
@@ -297,6 +305,7 @@ if command -v snap >/dev/null 2>&1; then
         info "DRY-RUN: Would refresh Snaps and remove old revisions"
     else
         safe_run "Refreshing Snaps" snap refresh
+        # Remove disabled/old revisions with better error handling
         snap list --all 2>/dev/null | grep "disabled" | awk '{print $1, $3}' | while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
         done
@@ -339,6 +348,28 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────
+# Record last run
+# ────────────────────────────────────────────────────────────────
+
+LAST_RUN_DIR="/var/lib/kali-update"
+LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
+
+if ! $DRY_RUN; then
+    mkdir -p "$LAST_RUN_DIR"
+    cat > "$LAST_RUN_FILE" << LAST
+VERSION=$VERSION
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+STATUS=success
+DISK_FREED_MB=$FREED_MB
+REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
+LOG_FILE=$LOG_FILE
+LAST
+    info "Last run record written to $LAST_RUN_FILE"
+else
+    info "DRY-RUN: Would write last-run record to $LAST_RUN_DIR/last-run"
+fi
+
+# ────────────────────────────────────────────────────────────────
 # Final status & summary
 # ────────────────────────────────────────────────────────────────
 
@@ -346,6 +377,7 @@ AFTER=$(df / --output=used | tail -1)
 FREED_KB=$(( BEFORE - AFTER ))
 FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB / 1024 }")
 
+# Validate if upgrades caused reboot-required during this run
 REBOOT_DURING_RUN=false
 if [ -f /var/run/reboot-required ]; then
     if [ $(stat -c %Y /var/run/reboot-required 2>/dev/null || echo 0) -gt $SCRIPT_START ]; then
