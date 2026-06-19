@@ -12,7 +12,7 @@ set -euo pipefail
 DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
-VERSION="5.8"
+VERSION="5.9"
 
 # Load config file if present
 for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
@@ -35,7 +35,7 @@ warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 error()    { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ────────────────────────────────────────────────────────────────
-# Logging
+# Logging (with color stripping for file)
 # ────────────────────────────────────────────────────────────────
 LOG_DIR="/var/log/kali-update"
 LOG_FILE="$LOG_DIR/kali-update-$(date +%Y%m%d-%H%M%S).log"
@@ -44,15 +44,15 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
-# Redirect all output (after functions are defined)
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Terminal gets colors, log file gets stripped
+exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 log "Running kali-update version: $VERSION"
 
-# Keep only the last N log files
+# Keep only the last N log files (improved for safety)
 log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
-find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\n' \
-    | sort -n | head -n "-$LOG_RETENTION" | cut -d' ' -f2- | xargs -r rm -f
+find "$LOG_DIR" -name "kali-update-*.log" -type f -print0 | \
+    xargs -0 stat -c '%Y %n' | sort -n | head -n "-$LOG_RETENTION" | cut -d' ' -f2- | xargs -r rm -f
 
 # Record start time for upgrade validation
 SCRIPT_START=$(date +%s)
@@ -120,10 +120,14 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Improved connectivity check (Kali archive)
 info "Checking internet connectivity..."
-if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-    error "No internet connection detected."
-    exit 1
+if ! timeout 5 bash -c "echo > /dev/tcp/archive.kali.org/443" 2>/dev/null; then
+    # Fallback to Google DNS
+    if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+        error "No internet connection detected."
+        exit 1
+    fi
 fi
 
 for partition in "/" "/var" "/boot"; do
@@ -136,7 +140,7 @@ for partition in "/" "/var" "/boot"; do
     fi
 done
 
-# Check for APT lock (fixed duplicate redirect)
+# Check for APT lock (cleaned)
 if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     warn "APT is locked by another process. Waiting up to 60s..."
     for i in {1..12}; do
@@ -264,7 +268,8 @@ else
     apt purge '~c' -y 2>&1 | tee -a "$APT_LOG" || warn "Purging residual configs had issues"
 fi
 
-# Remove old kernels (keep current + previous one) - fixed logic
+# Remove old kernels (keep current + previous one)
+# head -n -1 after sort -V removes the newest previous, keeping only older to remove
 info "Removing old kernels (keeping current + previous)..."
 CURRENT=$(uname -r)
 KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
@@ -324,7 +329,7 @@ if command -v journalctl >/dev/null 2>&1; then
     fi
 fi
 
-# Clean partial apt lists
+# Other cleanups
 if ! $DRY_RUN; then
     info "Cleaning partial package lists..."
     rm -rf /var/lib/apt/lists/partial/*
@@ -341,7 +346,7 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────
-# Record last run
+# Record last run (AFTER all variables are calculated)
 # ────────────────────────────────────────────────────────────────
 
 LAST_RUN_DIR="/var/lib/kali-update"
