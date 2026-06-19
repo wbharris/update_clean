@@ -2,6 +2,8 @@
 
 One clean update & cleanup script for Kali Linux.
 
+**Version:** See the `VERSION` file in this repo (or run `./kali-update.sh --version`)
+
 ## Main Script
 
 **`kali-update.sh`** — The complete update and cleanup script.
@@ -9,7 +11,7 @@ One clean update & cleanup script for Kali Linux.
 ### What it does
 
 **Update:**
-- Refreshes Kali keyring
+- Refreshes Kali keyring (with GPG verification)
 - Fixes interrupted installs and broken packages
 - `apt update`
 - Package cache check (`apt-get check`)
@@ -31,10 +33,11 @@ One clean update & cleanup script for Kali Linux.
 - Update GRUB after kernel changes
 
 **Other:**
-- Tracks disk usage before/after
+- Tracks disk usage before/after (across /, /var, /boot)
 - Keeps only the last **3** log files
 - Color output + clear logging
-- Safety checks (root, internet, disk space)
+- Records last run details in /var/lib/kali-update/last-run
+- Safety checks (root, internet, disk space, APT lock)
 
 ### Usage
 
@@ -42,13 +45,19 @@ One clean update & cleanup script for Kali Linux.
 sudo ./kali-update.sh
 ```
 
+Or with options:
+```bash
+sudo ./kali-update.sh --dry-run
+sudo ./kali-update.sh --no-kernel
+```
+
 Run periodically (recommended weekly).
 
-### Logging
+### Logging & Records
 
-Logs go to `/var/log/kali-update/`
-
-Only the most recent 3 logs are kept automatically.
+- Detailed logs: `/var/log/kali-update/`
+- Only the most recent 3 logs are kept automatically.
+- Last run record: `/var/lib/kali-update/last-run`
 
 ### Safety
 
@@ -62,11 +71,13 @@ Only the most recent 3 logs are kept automatically.
 **Cron example (weekly):**
 
 ```bash
-0 4 * * 0 /path/to/Kali\ Update/kali-update.sh >> /var/log/kali-update/cron.log 2>&1
+0 4 * * 0 /path/to/kali-update.sh
 ```
 
 Or use a systemd timer for more control.
 
-### Notes
+### Versioning
 
-This is the single, cleaned-up version. Older scripts have been removed.
+- Version is in the `VERSION` file.
+- Script also supports `--version`.
+- See `CHANGELOG.md` for history.
