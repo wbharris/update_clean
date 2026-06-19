@@ -49,6 +49,9 @@ Or with options:
 ```bash
 sudo ./kali-update.sh --dry-run
 sudo ./kali-update.sh --no-kernel
+sudo ./kali-update.sh --last          # Show last execution details
+sudo ./kali-update.sh --check         # Run pre-flight checks only
+sudo ./kali-update.sh --version
 ```
 
 Run periodically (recommended weekly).
@@ -81,3 +84,16 @@ Or use a systemd timer for more control.
 - Version is in the `VERSION` file.
 - Script also supports `--version`.
 - See `CHANGELOG.md` for history.
+
+### Quick Reference
+
+| Command                        | Description                          |
+|--------------------------------|--------------------------------------|
+| `./kali-update.sh`             | Full update + cleanup                |
+| `./kali-update.sh --dry-run`   | Show what would happen (no changes)  |
+| `./kali-update.sh --no-kernel` | Skip kernel removal                  |
+| `./kali-update.sh --last`      | Show details from last execution     |
+| `./kali-update.sh --check`     | Run all pre-flight checks only       |
+| `./kali-update.sh --version`   | Show version + last run info         |
+
+This script is designed to be safe for weekly unattended/cron use.
