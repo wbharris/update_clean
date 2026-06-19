@@ -12,7 +12,7 @@ set -euo pipefail
 DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
-VERSION="5.10"
+VERSION=$(cat VERSION 2>/dev/null || echo "unknown")
 
 # Load config file if present
 for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
@@ -160,7 +160,7 @@ if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     warn "systemd-resolved is not active. DNS resolution may be affected."
 fi
 
-BEFORE=$(df / --output=used | tail -1)
+BEFORE=$(df / /var /boot --output=used 2>/dev/null | awk 'NR>1 {s+=$1} END {print s}')
 
 # ────────────────────────────────────────────────────────────────
 # Simple file lock + trap
@@ -350,7 +350,7 @@ fi
 # Final status & summary
 # ────────────────────────────────────────────────────────────────
 
-AFTER=$(df / --output=used | tail -1)
+AFTER=$(df / /var /boot --output=used 2>/dev/null | awk 'NR>1 {s+=$1} END {print s}')
 FREED_KB=$(( BEFORE - AFTER ))
 FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB / 1024 }")
 
@@ -409,7 +409,7 @@ fi
 
 if $DRY_RUN; then success "Kali update and cleanup simulation completed (dry-run)."; else success "Kali update and cleanup completed successfully!"; fi
 log "=== Update Summary ==="
-log "Disk space freed: ${FREED_MB} MB"
+log "Disk space freed (/, /var, /boot): ${FREED_MB} MB"
 log "Full log saved to: $LOG_FILE"
 log "APT warnings logged to: $APT_LOG"
 exit 0
