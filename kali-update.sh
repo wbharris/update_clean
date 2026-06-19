@@ -12,7 +12,7 @@ set -euo pipefail
 DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
-VERSION="5.9"
+VERSION="5.10"
 
 # Load config file if present
 for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
@@ -44,15 +44,16 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
-# Terminal gets colors, log file gets stripped
-exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
+# Simple tee: colors go to terminal and (colored) to log file.
+# (Acceptable; colors can be stripped on viewing with `cat log | sed 's/\x1b\[[0-9;]*m//g'`)
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 log "Running kali-update version: $VERSION"
 
-# Keep only the last N log files (improved for safety)
+# Keep only the last N log files (improved for safety, null-delimited)
 log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
-find "$LOG_DIR" -name "kali-update-*.log" -type f -print0 | \
-    xargs -0 stat -c '%Y %n' | sort -n | head -n "-$LOG_RETENTION" | cut -d' ' -f2- | xargs -r rm -f
+find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\0' | \
+    sort -z -n | head -zn "-$LOG_RETENTION" | cut -zd' ' -f2- | xargs -0r rm -f
 
 # Record start time for upgrade validation
 SCRIPT_START=$(date +%s)
@@ -274,12 +275,12 @@ info "Removing old kernels (keeping current + previous)..."
 CURRENT=$(uname -r)
 KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
 if [ -n "$KERNELS" ]; then
-    echo "$KERNELS" | while read -r k; do
+    while read -r k; do
         apt purge -y "$k" 2>&1 | tee -a "$APT_LOG" || warn "Failed to purge $k"
         # Also remove matching headers and modules
         echo "$k" | sed 's/linux-image/linux-headers/' | xargs apt purge -y 2>/dev/null || true
         echo "$k" | sed 's/linux-image/linux-modules/'  | xargs apt purge -y 2>/dev/null || true
-    done
+    done <<< "$KERNELS"
 else
     info "No old kernels to remove."
 fi
