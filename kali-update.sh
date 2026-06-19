@@ -346,28 +346,6 @@ else
 fi
 
 # ────────────────────────────────────────────────────────────────
-# Record last run (AFTER all variables are calculated)
-# ────────────────────────────────────────────────────────────────
-
-LAST_RUN_DIR="/var/lib/kali-update"
-LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
-
-if ! $DRY_RUN; then
-    mkdir -p "$LAST_RUN_DIR"
-    cat > "$LAST_RUN_FILE" << LAST
-VERSION=$VERSION
-TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-STATUS=success
-DISK_FREED_MB=$FREED_MB
-REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
-LOG_FILE=$LOG_FILE
-LAST
-    info "Last run record written to $LAST_RUN_FILE"
-else
-    info "DRY-RUN: Would write last-run record"
-fi
-
-# ────────────────────────────────────────────────────────────────
 # Final status & summary
 # ────────────────────────────────────────────────────────────────
 
@@ -387,6 +365,28 @@ if [ "$REBOOT_DURING_RUN" = true ]; then
     warn "Run: sudo reboot"
 else
     success "No reboot required from this run."
+fi
+
+# ────────────────────────────────────────────────────────────────
+# Record last run (AFTER all variables calculated in summary)
+# ────────────────────────────────────────────────────────────────
+
+LAST_RUN_DIR="/var/lib/kali-update"
+LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
+
+if ! $DRY_RUN; then
+    mkdir -p "$LAST_RUN_DIR"
+    cat > "$LAST_RUN_FILE" << LAST
+VERSION=$VERSION
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+STATUS=success
+DISK_FREED_MB=$FREED_MB
+REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
+LOG_FILE=$LOG_FILE
+LAST
+    info "Last run record written to $LAST_RUN_FILE"
+else
+    info "DRY-RUN: Would write last-run record"
 fi
 
 # Optional: needrestart
