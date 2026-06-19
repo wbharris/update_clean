@@ -45,10 +45,12 @@ Usage: sudo $0 [options]
 Options:
   --dry-run       Simulate actions without making changes
   --no-kernel     Skip old kernel removal
+  --last, --status  Show information from the last run
+  --check, --doctor Run pre-flight checks only (no updates)
   --help, -h      Show this help
-  --version, -v   Show version
+  --version, -v   Show version information
 
-Environment:
+Environment / Config:
   LOG_RETENTION   Number of logs to keep (default: 3)
 USAGE
 }
@@ -63,12 +65,20 @@ while [[ $# -gt 0 ]]; do
             SKIP_KERNEL=true
             shift
             ;;
+        --last|--status)
+            show_last_run
+            exit 0
+            ;;
+        --check|--doctor)
+            run_preflight_checks
+            exit 0
+            ;;
         --help|-h)
             usage
             exit 0
             ;;
         --version|-v)
-            echo "kali-update $VERSION"
+            show_version
             exit 0
             ;;
         *)
@@ -140,6 +150,14 @@ for partition in "/" "/var" "/boot"; do
     fi
 done
 
+# Extra defensive check for /boot (common failure point for kernel updates)
+if [ -d /boot ]; then
+    boot_kb=$(df /boot --output=avail | tail -n 1)
+    if [ "$boot_kb" -lt 51200 ]; then   # < 50 MB
+        warn "Very low space on /boot (< 50 MB). Kernel updates may fail."
+    fi
+fi
+
 # Check for APT lock
 if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     warn "APT is locked by another process. Waiting up to 60s..."
@@ -181,6 +199,100 @@ safe_run() {
     if ! "$@"; then
         warn "$desc failed — continuing"
     fi
+}
+
+# ────────────────────────────────────────────────────────────────
+# New helper functions for --version, --last, --check
+# ────────────────────────────────────────────────────────────────
+
+show_version() {
+    echo "kali-update $VERSION"
+
+    # Git commit (if available)
+    if [ -d .git ]; then
+        local commit
+        commit=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        echo "Commit: $commit"
+    fi
+
+    # Last run info if available
+    local last_file="/var/lib/kali-update/last-run"
+    if [ -f "$last_file" ]; then
+        echo ""
+        echo "Last run:"
+        cat "$last_file" | sed 's/^/  /'
+    fi
+}
+
+show_last_run() {
+    local last_file="/var/lib/kali-update/last-run"
+    if [ -f "$last_file" ]; then
+        echo "Last run information:"
+        cat "$last_file"
+    else
+        echo "No last-run record found."
+    fi
+}
+
+run_preflight_checks() {
+    echo "=== Pre-flight Checks ==="
+
+    echo -n "Running as root: "
+    if [ "$EUID" -eq 0 ]; then echo "OK"; else echo "FAIL (must be root)"; fi
+
+    echo -n "Internet (archive.kali.org): "
+    if timeout 5 bash -c "echo > /dev/tcp/archive.kali.org/443" 2>/dev/null; then
+        echo "OK"
+    else
+        echo "FAIL (trying fallback)"
+        if ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+            echo "  Fallback OK (8.8.8.8)"
+        else
+            echo "  FAIL"
+        fi
+    fi
+
+    for part in / /var /boot; do
+        if [ -d "$part" ]; then
+            local avail
+            avail=$(df "$part" --output=avail | tail -n 1)
+            echo -n "Disk space on $part: "
+            if [ "$avail" -ge 2097152 ]; then
+                echo "OK ($(($avail / 1024)) MB free)"
+            else
+                echo "LOW ($(($avail / 1024)) MB free)"
+            fi
+        fi
+    done
+
+    echo -n "APT lock free: "
+    if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "LOCKED"
+    fi
+
+    echo -n "systemd-resolved active: "
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        echo "OK"
+    else
+        echo "INACTIVE"
+    fi
+
+    echo -n "Required tools: "
+    local missing=""
+    for tool in curl wget apt dpkg; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing="$missing $tool"
+        fi
+    done
+    if [ -z "$missing" ]; then
+        echo "OK"
+    else
+        echo "MISSING:$missing"
+    fi
+
+    echo "=== Checks complete ==="
 }
 
 # ────────────────────────────────────────────────────────────────
