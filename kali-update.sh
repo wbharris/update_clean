@@ -3,7 +3,6 @@
 # Full system update + thorough cleanup for Kali Rolling
 # Usage: sudo ./kali-update.sh [--dry-run] [--no-kernel] [--help] [--version]
 # Recommended: run weekly
-# Configurable via env or /etc/kali-update.conf
 
 set -euo pipefail
 
@@ -13,6 +12,7 @@ set -euo pipefail
 DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
+VERSION="5.8"
 
 # Load config file if present
 for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
@@ -20,13 +20,19 @@ for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-
 done
 
 # ────────────────────────────────────────────────────────────────
-# Colors
+# Colors (define early)
 # ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+log()      { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
+success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+error()    { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ────────────────────────────────────────────────────────────────
 # Logging
@@ -38,14 +44,10 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
-# Redirect all output
+# Redirect all output (after functions are defined)
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-log()      { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
-success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-error()    { echo -e "${RED}[ERROR]${NC} $1"; }
+log "Running kali-update version: $VERSION"
 
 # Keep only the last N log files
 log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
@@ -62,64 +64,6 @@ export DEBIAN_FRONTEND=noninteractive
 export APT_LISTCHANGES_FRONTEND=none
 
 # ────────────────────────────────────────────────────────────────
-# Pre-flight checks
-# ────────────────────────────────────────────────────────────────
-
-if [ "$EUID" -ne 0 ]; then
-    error "This script must be run as root (use sudo)."
-    exit 1
-fi
-
-info "Checking internet connectivity..."
-if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
-    error "No internet connection detected."
-    exit 1
-fi
-
-# Check disk space on critical partitions
-for partition in "/" "/var" "/boot"; do
-    if [ -d "$partition" ]; then
-        avail_kb=$(df "$partition" --output=avail | tail -n 1)
-        if [ "$avail_kb" -lt 2097152 ]; then
-            error "Less than 2 GB free on $partition"
-            exit 1
-        fi
-    fi
-done
-
-# Check for APT lock
-if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-    warn "APT is locked by another process. Waiting up to 60s..."
-    for i in {1..12}; do
-        if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-            break
-        fi
-        sleep 5
-    done
-    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 2>/dev/null; then
-        error "APT still locked after waiting. Please resolve and try again."
-        exit 1
-    fi
-fi
-
-if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    warn "systemd-resolved is not active. DNS resolution may be affected."
-fi
-
-# Record disk before
-BEFORE=$(df / --output=used | tail -1)
-
-# ────────────────────────────────────────────────────────────────
-# Simple file lock
-# ────────────────────────────────────────────────────────────────
-LOCKFILE="/var/run/kali-update.lock"
-exec 200>"$LOCKFILE"
-if ! flock -n 200; then
-    error "Another instance of kali-update is already running."
-    exit 1
-fi
-
-# ────────────────────────────────────────────────────────────────
 # CLI Parsing
 # ────────────────────────────────────────────────────────────────
 usage() {
@@ -132,13 +76,10 @@ Options:
   --help, -h      Show this help
   --version, -v   Show version
 
-Environment / Config:
+Environment:
   LOG_RETENTION   Number of logs to keep (default: 3)
-  Can be set in /etc/kali-update.conf or environment.
 USAGE
 }
-
-VERSION="5.8"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -171,7 +112,64 @@ if $DRY_RUN; then
 fi
 
 # ────────────────────────────────────────────────────────────────
-# Helper for non-critical steps
+# Pre-flight checks
+# ────────────────────────────────────────────────────────────────
+
+if [ "$EUID" -ne 0 ]; then
+    error "This script must be run as root (use sudo)."
+    exit 1
+fi
+
+info "Checking internet connectivity..."
+if ! ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1; then
+    error "No internet connection detected."
+    exit 1
+fi
+
+for partition in "/" "/var" "/boot"; do
+    if [ -d "$partition" ]; then
+        avail_kb=$(df "$partition" --output=avail | tail -n 1)
+        if [ "$avail_kb" -lt 2097152 ]; then
+            error "Less than 2 GB free on $partition"
+            exit 1
+        fi
+    fi
+done
+
+# Check for APT lock (fixed duplicate redirect)
+if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+    warn "APT is locked by another process. Waiting up to 60s..."
+    for i in {1..12}; do
+        if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+            break
+        fi
+        sleep 5
+    done
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+        error "APT still locked after waiting. Please resolve and try again."
+        exit 1
+    fi
+fi
+
+if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    warn "systemd-resolved is not active. DNS resolution may be affected."
+fi
+
+BEFORE=$(df / --output=used | tail -1)
+
+# ────────────────────────────────────────────────────────────────
+# Simple file lock + trap
+# ────────────────────────────────────────────────────────────────
+LOCKFILE="/var/run/kali-update.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    error "Another instance of kali-update is already running."
+    exit 1
+fi
+trap 'rm -f "$LOCKFILE"' EXIT
+
+# ────────────────────────────────────────────────────────────────
+# Helper
 # ────────────────────────────────────────────────────────────────
 safe_run() {
     local desc="$1"; shift
@@ -249,7 +247,6 @@ apt full-upgrade $APT_OPTS 2>&1 | tee -a "$APT_LOG" || warn "full-upgrade had is
 # Complete cleanup
 # ────────────────────────────────────────────────────────────────
 
-# Protect critical packages
 info "Holding critical packages to prevent accidental removal..."
 apt-mark hold base-files base-passwd bash coreutils util-linux linux-image-$(uname -r) 2>/dev/null || true
 
@@ -267,29 +264,26 @@ else
     apt purge '~c' -y 2>&1 | tee -a "$APT_LOG" || warn "Purging residual configs had issues"
 fi
 
-# Kernel removal
-if ! $SKIP_KERNEL && ! $DRY_RUN; then
-    info "Removing old kernels (keeping current + previous)..."
-    CURRENT=$(uname -r)
-    KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
-    if [ -n "$KERNELS" ]; then
-        echo "$KERNELS" | xargs apt purge -y 2>&1 | tee -a "$APT_LOG" || warn "Old kernel removal had issues"
-        for k in $KERNELS; do
-            echo "$k" | sed 's/linux-image/linux-headers/' | xargs apt purge -y 2>/dev/null || true
-            echo "$k" | sed 's/linux-image/linux-modules/'  | xargs apt purge -y 2>/dev/null || true
-        done
-    else
-        info "No old kernels to remove."
-    fi
-elif $DRY_RUN; then
-    info "DRY-RUN: Would remove old kernels (keeping current + previous)"
+# Remove old kernels (keep current + previous one) - fixed logic
+info "Removing old kernels (keeping current + previous)..."
+CURRENT=$(uname -r)
+KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | tail -n +2 || true)
+if [ -n "$KERNELS" ]; then
+    echo "$KERNELS" | while read -r k; do
+        apt purge -y "$k" 2>&1 | tee -a "$APT_LOG" || warn "Failed to purge $k"
+        # Also remove matching headers and modules
+        echo "$k" | sed 's/linux-image/linux-headers/' | xargs apt purge -y 2>/dev/null || true
+        echo "$k" | sed 's/linux-image/linux-modules/'  | xargs apt purge -y 2>/dev/null || true
+    done
+else
+    info "No old kernels to remove."
 fi
 
 if [ -n "$KERNELS" ] && command -v update-grub >/dev/null 2>&1 && ! $DRY_RUN; then
     safe_run "Updating GRUB bootloader" update-grub
 fi
 
-# Flatpak
+# Flatpak cleanup
 if command -v flatpak >/dev/null 2>&1; then
     if $DRY_RUN; then
         info "DRY-RUN: Would update Flatpaks and remove unused"
@@ -299,20 +293,19 @@ if command -v flatpak >/dev/null 2>&1; then
     fi
 fi
 
-# Snap
+# Snap cleanup
 if command -v snap >/dev/null 2>&1; then
     if $DRY_RUN; then
         info "DRY-RUN: Would refresh Snaps and remove old revisions"
     else
         safe_run "Refreshing Snaps" snap refresh
-        # Remove disabled/old revisions with better error handling
         snap list --all 2>/dev/null | grep "disabled" | awk '{print $1, $3}' | while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
         done
     fi
 fi
 
-# Firmware
+# Firmware updates
 if command -v fwupdmgr >/dev/null 2>&1; then
     if $DRY_RUN; then
         info "DRY-RUN: Would update firmware"
@@ -322,7 +315,7 @@ if command -v fwupdmgr >/dev/null 2>&1; then
     fi
 fi
 
-# Journal
+# Clean old journal logs
 if command -v journalctl >/dev/null 2>&1; then
     if $DRY_RUN; then
         info "DRY-RUN: Would vacuum journal logs"
@@ -331,7 +324,7 @@ if command -v journalctl >/dev/null 2>&1; then
     fi
 fi
 
-# Other cleanups
+# Clean partial apt lists
 if ! $DRY_RUN; then
     info "Cleaning partial package lists..."
     rm -rf /var/lib/apt/lists/partial/*
@@ -344,7 +337,7 @@ if ! $DRY_RUN; then
         safe_run "Rebuilding man page database" mandb -q
     fi
 else
-    info "DRY-RUN: Would perform final cleanups (partial lists, updatedb, mandb)"
+    info "DRY-RUN: Would perform final cleanups"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -366,7 +359,7 @@ LOG_FILE=$LOG_FILE
 LAST
     info "Last run record written to $LAST_RUN_FILE"
 else
-    info "DRY-RUN: Would write last-run record to $LAST_RUN_DIR/last-run"
+    info "DRY-RUN: Would write last-run record"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -377,7 +370,6 @@ AFTER=$(df / --output=used | tail -1)
 FREED_KB=$(( BEFORE - AFTER ))
 FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB / 1024 }")
 
-# Validate if upgrades caused reboot-required during this run
 REBOOT_DURING_RUN=false
 if [ -f /var/run/reboot-required ]; then
     if [ $(stat -c %Y /var/run/reboot-required 2>/dev/null || echo 0) -gt $SCRIPT_START ]; then
@@ -400,7 +392,7 @@ elif $DRY_RUN; then
     info "DRY-RUN: Would check for services needing restart"
 fi
 
-# Desktop notification (if available)
+# Desktop notification
 if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     MSG="Kali update completed. Freed ${FREED_MB} MB."
     if [ "$REBOOT_DURING_RUN" = true ]; then
