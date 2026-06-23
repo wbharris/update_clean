@@ -6,6 +6,14 @@
 # Configurable via env or /etc/kali-update.conf
 
 set -euo pipefail
+set -o errtrace
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    printf '%s\n' "This script requires Bash 4+. Found: ${BASH_VERSION:-unknown}" >&2
+    exit 1
+fi
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # ────────────────────────────────────────────────────────────────
 # Defaults & Config
@@ -13,16 +21,13 @@ set -euo pipefail
 DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
-VERSION=$(cat VERSION 2>/dev/null || echo "unknown")
+KERNEL_KEEP=${KERNEL_KEEP:-2}
+VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")
+EXIT_CODE=0
+KERNELS_REMOVED=false
+REBOOT_REQUIRED_MTIME_BEFORE=0
 
-# Load config file if present
-for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
-    [ -f "$conf" ] && source "$conf"
-done <<< "$KERNELS"
-
-# ────────────────────────────────────────────────────────────────
-# Colors (define early)
-# ────────────────────────────────────────────────────────────────
+# Colors (define before config load — load_config_files may warn)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,6 +39,165 @@ info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
 success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 error()    { echo -e "${RED}[ERROR]${NC} $1"; }
+
+load_config_files() {
+    local conf owner
+    for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
+        [ -f "$conf" ] || continue
+        if [[ "$conf" == /etc/* ]]; then
+            owner=$(stat -c %u "$conf" 2>/dev/null || echo "invalid")
+            if ! [[ "$owner" =~ ^[0-9]+$ ]] || [ "$owner" != "0" ]; then
+                warn "Config $conf not owned by root (uid=$owner); skipping"
+                continue
+            fi
+        fi
+        # shellcheck source=/dev/null
+        source "$conf"
+    done
+}
+
+load_config_files
+
+_record_failure() { EXIT_CODE=$((EXIT_CODE + 1)); }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+list_installed_kernel_images() {
+    dpkg-query -W -f='${Status}\t${Package}\n' 'linux-image-*' 2>/dev/null \
+        | awk -F'\t' '$1 ~ /^install ok installed/ {print $2}' \
+        | grep -E '^linux-image(-unsigned)?-[0-9][0-9a-zA-Z.\-+]*' \
+        | grep -Ev -- '-(meta|dbg|dbgsym|rt|cloud|kvm|virtual)$' \
+        | grep -Ev 'linux-image-(generic|generic-hwe|amd64)(-lts|-hwe)?$' \
+        | sort -V
+}
+
+find_running_kernel_pkg() {
+    local running_ver="$1"
+    shift
+    local pkg vmlinuz
+    local -a candidates=("$@")
+
+    [ -z "$running_ver" ] && return 1
+
+    vmlinuz="/boot/vmlinuz-${running_ver}"
+    if [ -f "$vmlinuz" ]; then
+        pkg=$(dpkg-query -S "$vmlinuz" 2>/dev/null | awk -F: '{print $1}' | head -n1)
+        if [ -n "$pkg" ]; then
+            printf '%s' "$pkg"
+            return 0
+        fi
+    fi
+
+    if [ "${#candidates[@]}" -eq 0 ]; then
+        mapfile -t candidates < <(list_installed_kernel_images)
+    fi
+
+    for pkg in "${candidates[@]}"; do
+        if [[ "$pkg" == *"$running_ver"* ]]; then
+            printf '%s' "$pkg"
+            return 0
+        fi
+    done
+    return 1
+}
+
+purge_kernel_related() {
+    local pkg="$1"
+    local ver suffix candidate related
+
+    if [[ "$pkg" =~ ^linux-image-(.+)$ ]]; then
+        ver="${BASH_REMATCH[1]}"
+        for suffix in headers modules-extra modules modules-unsigned; do
+            candidate="linux-${suffix}-${ver}"
+            if dpkg-query -W -f='${Status}' "$candidate" 2>/dev/null | grep -q 'install ok installed'; then
+                if $DRY_RUN; then
+                    info "DRY-RUN: Would purge $candidate"
+                else
+                    apt-get purge -y "$candidate" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
+                fi
+            fi
+        done
+        while IFS= read -r related; do
+            [ -z "$related" ] || [ "$related" = "$pkg" ] && continue
+            if $DRY_RUN; then
+                info "DRY-RUN: Would purge $related"
+            else
+                apt-get purge -y "$related" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
+            fi
+        done < <(
+            dpkg-query -W -f='${Package}\n' 2>/dev/null \
+                | grep -E '^linux-(headers|modules)' \
+                | grep -F -- "$ver" || true
+        )
+    fi
+}
+
+remove_old_kernels() {
+    local -a kernels=() to_remove=()
+    local running_pkg running_ver pkg delcount keep boot_kb
+
+    if [ -d /boot ]; then
+        boot_kb=$(df -B 1K /boot 2>/dev/null | awk 'NR==2 {print $4+0}')
+        if [ "${boot_kb:-0}" -lt 10240 ]; then
+            warn "Skipping kernel removal: /boot has less than 10 MB free"
+            return 0
+        fi
+    fi
+
+    mapfile -t kernels < <(list_installed_kernel_images)
+
+    running_ver=$(uname -r 2>/dev/null || true)
+    running_pkg=$(find_running_kernel_pkg "$running_ver" "${kernels[@]}" || true)
+
+    if [ -n "$running_pkg" ]; then
+        info "Running kernel package: $running_pkg ($running_ver)"
+    elif [ -n "$running_ver" ]; then
+        warn "Could not match package for running kernel $running_ver; skipping kernel removal"
+        return 0
+    fi
+
+    if [ "${#kernels[@]}" -eq 0 ]; then
+        info "No linux-image packages found."
+        return 0
+    fi
+
+    for pkg in "${kernels[@]}"; do
+        if [ -n "$running_pkg" ] && [ "$pkg" = "$running_pkg" ]; then
+            continue
+        fi
+        if [ -n "$running_ver" ] && [[ "$pkg" == *"$running_ver"* ]]; then
+            continue
+        fi
+        to_remove+=("$pkg")
+    done
+
+    keep="${KERNEL_KEEP:-2}"
+    if [ "${#to_remove[@]}" -le "$keep" ]; then
+        info "No old kernels to remove (keeping $keep beside running kernel)."
+        return 0
+    fi
+
+    delcount=$(( ${#to_remove[@]} - keep ))
+    if [ "$delcount" -lt 1 ] || [ "$delcount" -gt "${#to_remove[@]}" ]; then
+        warn "Kernel removal count out of range; skipping"
+        return 0
+    fi
+
+    KERNELS_REMOVED=true
+    info "Kernels scheduled for removal ($delcount):"
+    for pkg in "${to_remove[@]:0:delcount}"; do
+        info "  $pkg"
+    done
+
+    for pkg in "${to_remove[@]:0:delcount}"; do
+        if $DRY_RUN; then
+            info "DRY-RUN: Would purge old kernel: $pkg"
+            continue
+        fi
+        info "Purging old kernel: $pkg"
+        apt-get purge -y "$pkg" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || warn "Failed to purge $pkg"
+        purge_kernel_related "$pkg"
+    done
+}
 
 # ────────────────────────────────────────────────────────────────
 # CLI Parsing (do this very early, before logging or heavy work)
@@ -52,6 +216,7 @@ Options:
 
 Environment / Config:
   LOG_RETENTION   Number of logs to keep (default: 3)
+  KERNEL_KEEP     Kernels to keep besides running (default: 2)
 USAGE
 }
 
@@ -114,7 +279,7 @@ run_preflight_checks() {
                 echo "LOW ($(($avail / 1024)) MB free)"
             fi
         fi
-    done <<< "$KERNELS"
+    done
 
     echo -n "APT lock free: "
     if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
@@ -136,7 +301,7 @@ run_preflight_checks() {
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing="$missing $tool"
         fi
-    done <<< "$KERNELS"
+    done
     if [ -z "$missing" ]; then
         echo "OK"
     else
@@ -177,10 +342,11 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
     esac
-done <<< "$KERNELS"
+done
 
 if $DRY_RUN; then
     info "DRY RUN MODE ENABLED - No changes will be made"
+    info "DRY-RUN skips keyring refresh, apt-get update, and destructive steps"
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -193,8 +359,7 @@ APT_LOG="$LOG_FILE.apt-warnings"
 mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
-# Colors are sent to terminal. Log file receives the output as-is (colors are stripped in practice by how the script is used, or can be post-processed).
-exec > >(tee -a "$LOG_FILE") 2>&1
+exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 log "Running kali-update version: $VERSION"
 
@@ -203,8 +368,10 @@ log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
 find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\0' | \
     sort -z -n | head -zn "-$LOG_RETENTION" | cut -zd' ' -f2- | xargs -0r rm -f
 
-# Record start time for upgrade validation
 SCRIPT_START=$(date +%s)
+if [ -f /var/run/reboot-required ]; then
+    REBOOT_REQUIRED_MTIME_BEFORE=$(stat -c %Y /var/run/reboot-required 2>/dev/null || echo 0)
+fi
 
 # ────────────────────────────────────────────────────────────────
 # Environment
@@ -238,7 +405,7 @@ for partition in "/" "/var" "/boot"; do
             exit 1
         fi
     fi
-done <<< "$KERNELS"
+done
 
 # Extra defensive check for /boot (common failure point for kernel updates)
 if [ -d /boot ]; then
@@ -256,7 +423,7 @@ if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
             break
         fi
         sleep 5
-    done <<< "$KERNELS"
+    done
     if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
         error "APT still locked after waiting. Please resolve and try again."
         exit 1
@@ -278,7 +445,17 @@ if ! flock -n 200; then
     error "Another instance of kali-update is already running."
     exit 1
 fi
-trap 'rm -f "$LOCKFILE"' EXIT
+cleanup() {
+    trap - INT TERM EXIT ERR
+    local rc=${1:-$?}
+    sync 2>/dev/null || true
+    flock -u 200 2>/dev/null || true
+    exec 200>&- 2>/dev/null || true
+    rm -f "$LOCKFILE" 2>/dev/null || true
+    exit "$rc"
+}
+
+trap 'cleanup $?' INT TERM EXIT
 
 # ────────────────────────────────────────────────────────────────
 # Helper for non-critical steps
@@ -301,72 +478,91 @@ safe_run() {
 # Keyring (with signature verification)
 # ────────────────────────────────────────────────────────────────
 
-info "Refreshing Kali archive keyring..."
-KEYRING_URL="https://archive.kali.org/archive-keyring.gpg"
-KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
-KEYRING_ASC_URL="${KEYRING_URL}.asc"
-KEYRING_ASC_PATH="${KEYRING_PATH}.asc"
-
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$KEYRING_URL" -o "$KEYRING_PATH" || warn "Failed to download keyring"
-    curl -fsSL "$KEYRING_ASC_URL" -o "$KEYRING_ASC_PATH" 2>/dev/null || true
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$KEYRING_PATH" "$KEYRING_URL" || warn "Failed to download keyring"
-    wget -qO "$KEYRING_ASC_PATH" "$KEYRING_ASC_URL" 2>/dev/null || true
+if $DRY_RUN; then
+    info "DRY-RUN: Would refresh Kali archive keyring from archive.kali.org"
 else
-    warn "curl/wget not available — skipping keyring refresh"
-fi
+    info "Refreshing Kali archive keyring..."
+    KEYRING_URL="https://archive.kali.org/archive-keyring.gpg"
+    KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
+    KEYRING_ASC_URL="${KEYRING_URL}.asc"
+    KEYRING_ASC_PATH="${KEYRING_PATH}.asc"
 
-if [ -f "$KEYRING_ASC_PATH" ] && [ -f "$KEYRING_PATH" ]; then
-    if command -v gpg >/dev/null 2>&1; then
-        if gpg --verify "$KEYRING_ASC_PATH" "$KEYRING_PATH" >/dev/null 2>&1; then
-            info "Keyring signature verified successfully"
-        else
-            warn "Keyring signature verification failed — using anyway (may cause issues)"
-        fi
+    if has_cmd curl; then
+        curl -fsSL "$KEYRING_URL" -o "$KEYRING_PATH" || warn "Failed to download keyring"
+        curl -fsSL "$KEYRING_ASC_URL" -o "$KEYRING_ASC_PATH" 2>/dev/null || true
+    elif has_cmd wget; then
+        wget -qO "$KEYRING_PATH" "$KEYRING_URL" || warn "Failed to download keyring"
+        wget -qO "$KEYRING_ASC_PATH" "$KEYRING_ASC_URL" 2>/dev/null || true
     else
-        warn "gpg not installed, skipping signature verification (install gnupg for better security)"
+        warn "curl/wget not available — skipping keyring refresh"
     fi
-    rm -f "$KEYRING_ASC_PATH"
+
+    if [ -f "$KEYRING_ASC_PATH" ] && [ -f "$KEYRING_PATH" ]; then
+        if has_cmd gpg; then
+            if gpg --verify "$KEYRING_ASC_PATH" "$KEYRING_PATH" >/dev/null 2>&1; then
+                info "Keyring signature verified successfully"
+            else
+                warn "Keyring signature verification failed — using anyway (may cause issues)"
+            fi
+        else
+            warn "gpg not installed, skipping signature verification (install gnupg for better security)"
+        fi
+        rm -f "$KEYRING_ASC_PATH"
+    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
 # Core update
 # ────────────────────────────────────────────────────────────────
 
-info "Configuring any interrupted package installations..."
-dpkg --configure -a || warn "dpkg --configure -a had issues"
-
-info "Fixing broken dependencies..."
-apt install -f -y || warn "apt install -f had issues"
-
-info "Updating package lists..."
-apt update
-
-info "Checking package cache integrity (apt-get check)..."
-apt-get check || warn "Package cache check reported issues"
-
-APT_OPTS="-y"
 if $DRY_RUN; then
-    APT_OPTS="-s"
-    info "DRY-RUN: Using simulation mode for APT commands"
+    info "DRY-RUN: Would run dpkg --configure -a"
+    info "DRY-RUN: Would run apt-get install -f"
+    info "DRY-RUN: Would run apt-get update (skipped)"
+else
+    info "Configuring any interrupted package installations..."
+    dpkg --configure -a || warn "dpkg --configure -a had issues"
+
+    info "Fixing broken dependencies..."
+    apt-get install -f -y || warn "apt install -f had issues"
+
+    info "Updating package lists..."
+    apt-get update 2>&1 | tee -a "$APT_LOG" || warn "apt-get update had issues"
 fi
 
-info "Upgrading packages..."
-apt upgrade $APT_OPTS 2>&1 | tee -a "$APT_LOG" || warn "apt upgrade had issues"
+info "Checking package cache integrity (apt-get check)..."
+apt-get check || warn "Package cache check reported issues (see $APT_LOG)"
 
-info "Listing upgradable packages after initial upgrade:"
-apt list --upgradable 2>/dev/null || true
+if $DRY_RUN; then
+    info "DRY-RUN: Would run apt-get upgrade"
+    info "DRY-RUN: Would run apt-get full-upgrade"
+    apt list --upgradable 2>/dev/null | sed -n '1,40p' || true
+else
+    info "Upgrading packages..."
+    apt-get upgrade -y 2>&1 | tee -a "$APT_LOG" || warn "apt upgrade had issues (see $APT_LOG)"
 
-info "Performing full system upgrade..."
-apt full-upgrade $APT_OPTS 2>&1 | tee -a "$APT_LOG" || warn "full-upgrade had issues"
+    info "Listing upgradable packages after initial upgrade:"
+    apt list --upgradable 2>/dev/null || true
+
+    info "Performing full system upgrade..."
+    apt-get full-upgrade -y 2>&1 | tee -a "$APT_LOG" || warn "full-upgrade had issues (see $APT_LOG)"
+fi
 
 # ────────────────────────────────────────────────────────────────
 # Complete cleanup
 # ────────────────────────────────────────────────────────────────
 
-info "Holding critical packages to prevent accidental removal..."
-apt-mark hold base-files base-passwd bash coreutils util-linux linux-image-$(uname -r) 2>/dev/null || true
+if $DRY_RUN; then
+    info "DRY-RUN: Would hold critical packages"
+else
+    info "Holding critical packages to prevent accidental removal..."
+    running_kimg=$(find_running_kernel_pkg "$(uname -r)" || true)
+    if [ -n "$running_kimg" ]; then
+        apt-mark hold base-files base-passwd bash coreutils util-linux "$running_kimg" 2>/dev/null || true
+    else
+        apt-mark hold base-files base-passwd bash coreutils util-linux 2>/dev/null || true
+    fi
+fi
 
 if $DRY_RUN; then
     info "DRY-RUN: Would run autoremove, clean, purge configs, kernel removal, etc."
@@ -382,22 +578,17 @@ else
     apt purge '~c' -y 2>&1 | tee -a "$APT_LOG" || warn "Purging residual configs had issues"
 fi
 
-# Remove old kernels (keep current + previous one)
-info "Removing old kernels (keeping current + previous)..."
-CURRENT=$(uname -r)
-KERNELS=$(dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/ {print $2}' | grep -v "$CURRENT" | sort -V | head -n -1 || true)
-if [ -n "$KERNELS" ]; then
-    while read -r k; do
-        apt purge -y "$k" 2>&1 | tee -a "$APT_LOG" || warn "Failed to purge $k"
-        # Also remove matching headers and modules
-        echo "$k" | sed 's/linux-image/linux-headers/' | xargs apt purge -y 2>/dev/null || true
-        echo "$k" | sed 's/linux-image/linux-modules/'  | xargs apt purge -y 2>/dev/null || true
-    done <<< "$KERNELS"
+if $SKIP_KERNEL; then
+    info "Skipping old kernel removal (--no-kernel)."
 else
-    info "No old kernels to remove."
+    remove_old_kernels
 fi
 
-if [ -n "$KERNELS" ] && command -v update-grub >/dev/null 2>&1 && ! $DRY_RUN; then
+if $KERNELS_REMOVED; then
+    info "Old kernels were removed or scheduled. Recovery: boot GRUB and select a previous kernel."
+fi
+
+if $KERNELS_REMOVED && has_cmd update-grub && ! $DRY_RUN; then
     safe_run "Updating GRUB bootloader" update-grub
 fi
 
@@ -419,7 +610,7 @@ if command -v snap >/dev/null 2>&1; then
         safe_run "Refreshing Snaps" snap refresh
         snap list --all 2>/dev/null | grep "disabled" | awk '{print $1, $3}' | while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
-        done <<< "$KERNELS"
+        done
     fi
 fi
 
@@ -469,7 +660,9 @@ FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB / 1024 }")
 
 REBOOT_DURING_RUN=false
 if [ -f /var/run/reboot-required ]; then
-    if [ $(stat -c %Y /var/run/reboot-required 2>/dev/null || echo 0) -gt $SCRIPT_START ]; then
+    reboot_mtime=$(stat -c %Y /var/run/reboot-required 2>/dev/null || echo 0)
+    if [ "$reboot_mtime" -gt "$REBOOT_REQUIRED_MTIME_BEFORE" ] \
+        && [ "$reboot_mtime" -ge "$SCRIPT_START" ]; then
         REBOOT_DURING_RUN=true
     fi
 fi
@@ -491,10 +684,13 @@ LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
 
 if ! $DRY_RUN; then
     mkdir -p "$LAST_RUN_DIR"
+    RUN_STATUS=success
+    [ "$EXIT_CODE" -ne 0 ] && RUN_STATUS=failure
     cat > "$LAST_RUN_FILE" << LAST
 VERSION=$VERSION
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-STATUS=success
+STATUS=$RUN_STATUS
+FAILURES=$EXIT_CODE
 DISK_FREED_MB=$FREED_MB
 REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
 LOG_FILE=$LOG_FILE
@@ -524,9 +720,16 @@ if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     notify-send "Kali Update" "$MSG" 2>/dev/null || true
 fi
 
-success "Kali update and cleanup completed successfully!"
 log "=== Update Summary ==="
 log "Disk space freed (/, /var, /boot): ${FREED_MB} MB"
+log "Failures recorded: $EXIT_CODE"
 log "Full log saved to: $LOG_FILE"
 log "APT warnings logged to: $APT_LOG"
-exit 0
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+    success "Kali update and cleanup completed successfully!"
+    exit 0
+else
+    warn "Kali update finished with $EXIT_CODE failure(s)."
+    exit 1
+fi

@@ -5,6 +5,31 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.13] - 2026-06-23
+
+### Added
+- `KERNEL_KEEP` env/config option (kernels to keep besides running; default: 2)
+- Robust kernel removal: `list_installed_kernel_images`, `find_running_kernel_pkg`, `purge_kernel_related`, `remove_old_kernels`
+- Bash 4+ requirement check; `set -o errtrace`
+- `/etc/kali-update.conf` ownership validation (must be root-owned)
+- ANSI color stripping in log files via `tee` + `sed`
+- Reboot detection via before/after mtime of `/var/run/reboot-required`
+- `FAILURES` and non-zero exit when failures are recorded
+- Improved `cleanup()` trap: `flock` release, `sync`, proper exit code
+
+### Changed
+- Dry-run no longer runs keyring download, `dpkg --configure`, `apt-get update`, `apt-mark hold`, or destructive cleanup steps
+- Dry-run logs planned kernel purges instead of executing them
+- `apt-get` used for scripted APT steps (instead of `apt` alias)
+- Running kernel package resolved dynamically for `apt-mark hold`
+
+### Fixed
+- Removed stray `done <<< "$KERNELS"` redirects from unrelated loops (config, preflight, snap, etc.)
+- `--no-kernel` flag now honored before kernel removal
+- Kernel removal no longer uses broken `head -n -1` logic (wrong kernel could be removed)
+- Renamed `KERNELS` shadowing to `KERNELS_REMOVED` flag
+- Logging helpers defined before `load_config_files()` (fixes `warn` before definition)
+
 ## [5.8] - 2026-06-19
 
 ### Added

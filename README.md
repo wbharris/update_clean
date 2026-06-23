@@ -22,7 +22,7 @@ One clean update & cleanup script for Kali Linux.
 - `apt --purge autoremove`
 - `apt autoclean` + `apt clean`
 - Purge residual config files (`apt purge '~c'`)
-- Remove old kernels (keeps current + previous for safety)
+- Remove old kernels (keeps running kernel + `KERNEL_KEEP` others; default 2)
 - Remove old snap revisions
 - Update + remove unused Flatpaks
 - Firmware updates (fwupdmgr)
@@ -56,6 +56,21 @@ sudo ./kali-update.sh --version
 
 Run periodically (recommended weekly).
 
+### Configuration
+
+Optional config files (first found wins per path order):
+
+- `/etc/kali-update.conf` (must be root-owned)
+- `~/.config/kali-update.conf`
+- `~/.kali-update.conf`
+
+Variables:
+
+| Variable        | Default | Description                              |
+|-----------------|---------|------------------------------------------|
+| `LOG_RETENTION` | 3       | Number of log files to keep              |
+| `KERNEL_KEEP`   | 2       | Extra kernels to keep besides running    |
+
 ### Logging & Records
 
 - Detailed logs: `/var/log/kali-update/`
@@ -66,7 +81,8 @@ Run periodically (recommended weekly).
 
 - Must run as root.
 - Requires at least 2GB free disk space.
-- Keeps current + one previous kernel as fallback.
+- Keeps running kernel plus `KERNEL_KEEP` additional kernels (default: 2).
+- `--dry-run` skips state-changing steps (keyring, apt update, holds, purges).
 - Non-critical steps won't stop the script.
 
 ### Scheduling
