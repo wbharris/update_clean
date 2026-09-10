@@ -27,6 +27,7 @@ One clean update & cleanup script for Kali Linux.
 - Update + remove unused Flatpaks
 - Firmware updates (fwupdmgr)
 - Vacuum journal logs (last 30 days)
+- Remove regenerable pip / go-build / uv caches (`CLEAN_DEV_CACHES`, default on)
 - Clean partial apt lists
 - Update locate database (if present)
 - Rebuild man database
@@ -66,10 +67,11 @@ Optional config files (first found wins per path order):
 
 Variables:
 
-| Variable        | Default | Description                              |
-|-----------------|---------|------------------------------------------|
-| `LOG_RETENTION` | 3       | Number of log files to keep              |
-| `KERNEL_KEEP`   | 2       | Extra kernels to keep besides running    |
+| Variable           | Default | Description |
+|--------------------|---------|-------------|
+| `LOG_RETENTION`    | 3       | Number of log files to keep |
+| `KERNEL_KEEP`      | 2       | Extra kernels to keep besides running |
+| `CLEAN_DEV_CACHES` | true    | Remove `/root` (and sudo user) `.cache/{pip,go-build,uv}`. Next pip/go/uv job is slower until the cache rebuilds. Set `false` to skip. |
 
 ### Logging & Records
 

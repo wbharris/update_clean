@@ -38,6 +38,8 @@ DRY_RUN=false
 SKIP_KERNEL=false
 LOG_RETENTION=${LOG_RETENTION:-3}
 KERNEL_KEEP=${KERNEL_KEEP:-2}
+# Wipe regenerable pip/go/uv caches (large; next pip/go/uv job rebuilds them)
+CLEAN_DEV_CACHES=${CLEAN_DEV_CACHES:-true}
 VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "unknown")
 EXIT_CODE=0
 KERNELS_REMOVED=false
@@ -74,8 +76,49 @@ load_config_files() {
 
 load_config_files
 
+# Re-apply defaults so empty config values do not disable features
+LOG_RETENTION=${LOG_RETENTION:-3}
+KERNEL_KEEP=${KERNEL_KEEP:-2}
+CLEAN_DEV_CACHES=${CLEAN_DEV_CACHES:-true}
+
 _record_failure() { EXIT_CODE=$((EXIT_CODE + 1)); }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+_is_truthy() {
+    case "${1,,}" in
+        true|yes|on|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Remove regenerable toolchain caches only (not GOPATH sources or project trees).
+clean_dev_caches() {
+    local home dir cache size
+    local -a homes=()
+    local -a caches=(pip go-build uv)
+
+    homes+=("/root")
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+        if [ -n "$home" ] && [ -d "$home" ]; then
+            homes+=("$home")
+        fi
+    fi
+
+    for home in "${homes[@]}"; do
+        for cache in "${caches[@]}"; do
+            dir="$home/.cache/$cache"
+            [ -e "$dir" ] || continue
+            size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+            if $DRY_RUN; then
+                info "DRY-RUN: Would remove $dir ($size)"
+                continue
+            fi
+            info "Removing regenerable cache $dir ($size)"
+            rm -rf "$dir" || warn "Failed to remove $dir"
+        done
+    done
+}
 
 list_installed_kernel_images() {
     dpkg-query -W -f='${Status}\t${Package}\n' 'linux-image-*' 2>/dev/null \
@@ -231,8 +274,9 @@ Options:
   --version, -v   Show version information
 
 Environment / Config:
-  LOG_RETENTION   Number of logs to keep (default: 3)
-  KERNEL_KEEP     Kernels to keep besides running (default: 2)
+  LOG_RETENTION     Number of logs to keep (default: 3)
+  KERNEL_KEEP       Kernels to keep besides running (default: 2)
+  CLEAN_DEV_CACHES  Remove pip/go-build/uv caches (default: true)
 USAGE
 }
 
@@ -638,6 +682,12 @@ if command -v fwupdmgr >/dev/null 2>&1; then
         safe_run "Refreshing firmware metadata" fwupdmgr refresh --force
         safe_run "Applying firmware updates" fwupdmgr update -y || true
     fi
+fi
+
+if _is_truthy "$CLEAN_DEV_CACHES"; then
+    clean_dev_caches
+else
+    info "Skipping pip/go-build/uv cache cleanup (CLEAN_DEV_CACHES=$CLEAN_DEV_CACHES)"
 fi
 
 # Clean old journal logs (keep last 30 days)

@@ -5,6 +5,11 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.14] - 2026-09-10
+
+### Added
+- `CLEAN_DEV_CACHES` (default: true) removes regenerable `/root/.cache/{pip,go-build,uv}` (and the sudo user's copies). Next pip/go/uv job rebuilds the cache. Set `CLEAN_DEV_CACHES=false` to skip.
+
 ## [5.13] - 2026-06-23
 
 ### Added
