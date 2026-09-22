@@ -23,7 +23,7 @@ One clean update & cleanup script for Kali Linux.
 - `apt autoclean` + `apt clean`
 - Purge residual config files (`apt purge '~c'`)
 - Remove old kernels (keeps running kernel + `KERNEL_KEEP` others; default 2), including Kali `linux-binary-*` packages
-- If `http.kali.org` fails, retry the Kali index on `kali.download`, then other mirrors, and keep the mirror that works
+- Prefer an HTTPS Kali mirror (`https://http.kali.org/kali`, then `https://kali.download/kali`). An HTTP mirror is used only for that run and is not saved. A third-party repo failure does not change the Kali line
 - Hold essential packages only during autoremove (a lasting hold blocks their upgrades)
 - Remove old snap revisions
 - Update + remove unused Flatpaks

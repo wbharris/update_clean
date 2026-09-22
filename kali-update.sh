@@ -389,11 +389,18 @@ run_preflight_checks() {
         echo "LOCKED"
     fi
 
+    echo -n "DNS (archive.kali.org): "
+    if getent hosts archive.kali.org >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "FAIL"
+    fi
+
     echo -n "systemd-resolved active: "
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         echo "OK"
     else
-        echo "INACTIVE"
+        echo "inactive"
     fi
 
     echo -n "Required tools: "
@@ -541,8 +548,8 @@ if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     fi
 fi
 
-if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    warn "systemd-resolved is not active. DNS resolution may be affected."
+if ! getent hosts archive.kali.org >/dev/null 2>&1; then
+    warn "Name resolution failed for archive.kali.org."
 fi
 
 BEFORE=$(df / /var /boot --output=used 2>/dev/null | awk 'NR>1 {s+=$1} END {print s}')
@@ -561,6 +568,11 @@ cleanup() {
     local rc=${1:-$?}
     if [ "${AUTOREMOVE_HOLD_ACTIVE:-false}" = true ]; then
         apt-mark unhold base-files base-passwd bash coreutils util-linux ${RUNNING_KIMG_HELD:-} >/dev/null 2>&1 || true
+    fi
+    if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] && [ -n "${KALI_SOURCES_BACKUP:-}" ] && [ -f "$KALI_SOURCES_BACKUP" ]; then
+        cp -a "$KALI_SOURCES_BACKUP" /etc/apt/sources.list 2>/dev/null || true
+        rm -f "$KALI_SOURCES_BACKUP"
+        KALI_MIRROR_TEMPORARY=false
     fi
     sync 2>/dev/null || true
     flock -u 200 2>/dev/null || true
@@ -647,35 +659,57 @@ refresh_kali_keyring() {
     return 1
 }
 
-# apt-get update exits 0 when only some indexes fail. Treat a Kali fetch
-# failure as a miss and retry against another mirror for the rest of this run.
-# A mirror that works is written to /etc/apt/sources.list so upgrade uses it too.
-KALI_MIRROR_FALLBACKS=(
+# apt-get update exits 0 when only some indexes fail. A Kali miss retries
+# mirrors. HTTPS mirrors may be saved. An HTTP fallback is used only for this
+# run, then the previous sources.list is restored. A third-party repo failure
+# (Proton, for example) does not change the Kali line.
+KALI_MIRROR_HTTPS=(
+    "https://http.kali.org/kali"
     "https://kali.download/kali"
+)
+KALI_MIRROR_HTTP=(
     "http://ftp.halifax.rwth-aachen.de/kali"
     "http://mirror.math.princeton.edu/pub/kali"
 )
 UPGRADE_OK=true
+KALI_SOURCES_BACKUP=""
+KALI_MIRROR_TEMPORARY=false
+STILL_UPGRADABLE=""
 
 _kali_fetch_failed() {
     local outfile="$1"
     grep -E -q 'Failed to fetch https?://[^[:space:]]*kali[^[:space:]]*' "$outfile"
 }
 
-apt_get_update_with_fallback() {
-    local out rc mirror backup
-    out=$(mktemp)
-    rc=0
-    info "Updating package lists..."
-    apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
-    if [ "$rc" -eq 0 ] && ! _kali_fetch_failed "$out"; then
-        rm -f "$out"
-        return 0
-    fi
+_current_kali_mirror() {
+    awk '/^[[:space:]]*deb[[:space:]]/ && $2 ~ /\/kali$/ { print $2; exit }' /etc/apt/sources.list 2>/dev/null || true
+}
 
-    warn "Kali package index failed; trying alternate mirrors"
+_mirror_already_listed() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+apt_get_update_with_fallback() {
+    local out rc mirror backup current
+    local -a order=()
+
+    out=$(mktemp)
     if [ ! -f /etc/apt/sources.list ]; then
         rm -f "$out"
+        warn "No /etc/apt/sources.list; cannot update Kali"
+        _record_failure
+        UPGRADE_OK=false
+        return 1
+    fi
+    if ! grep -E -q '^[[:space:]]*deb[[:space:]]+https?://[^[:space:]]+/kali[[:space:]]' /etc/apt/sources.list; then
+        rm -f "$out"
+        warn "No Kali deb line in /etc/apt/sources.list"
         _record_failure
         UPGRADE_OK=false
         return 1
@@ -683,26 +717,66 @@ apt_get_update_with_fallback() {
 
     backup=$(mktemp)
     cp -a /etc/apt/sources.list "$backup"
-    for mirror in "${KALI_MIRROR_FALLBACKS[@]}"; do
-        if ! grep -E -q 'https?://[^[:space:]]+/kali' "$backup"; then
-            warn "No Kali mirror line in /etc/apt/sources.list; cannot retry"
-            break
-        fi
-        info "Retrying apt-get update via $mirror"
+    current=$(_current_kali_mirror)
+
+    # Official HTTPS first, unless that is already the configured mirror
+    # (then try it before the other HTTPS mirror). HTTP stays last.
+    if [[ "$current" == https://* ]]; then
+        order+=("$current")
+    fi
+    for mirror in "${KALI_MIRROR_HTTPS[@]}"; do
+        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
+        order+=("$mirror")
+    done
+    if [ -n "$current" ]; then
+        _mirror_already_listed "$current" "${order[@]+"${order[@]}"}" || order+=("$current")
+    fi
+    for mirror in "${KALI_MIRROR_HTTP[@]}"; do
+        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
+        order+=("$mirror")
+    done
+
+    info "Updating package lists..."
+    for mirror in "${order[@]}"; do
         sed -E "s#https?://[^[:space:]]+/kali#${mirror}#g" "$backup" > /etc/apt/sources.list
+        if [ "$mirror" != "$current" ]; then
+            info "Trying Kali mirror $mirror"
+        fi
         : >"$out"
         rc=0
         apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
-        if [ "$rc" -eq 0 ] && ! _kali_fetch_failed "$out"; then
-            info "Kali mirror in use for this run: $mirror (written to /etc/apt/sources.list)"
+        if _kali_fetch_failed "$out"; then
+            warn "Mirror $mirror did not serve the Kali index"
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
+            warn "A non-Kali repository failed during apt-get update; keeping Kali mirror $mirror"
+        fi
+        if [[ "$mirror" == https://* ]]; then
+            info "Kali mirror in use: $mirror (saved to /etc/apt/sources.list)"
+            KALI_MIRROR_TEMPORARY=false
             rm -f "$out" "$backup"
+            KALI_SOURCES_BACKUP=""
             return 0
         fi
-        warn "Mirror $mirror did not serve the Kali index"
+        if [ "$mirror" = "$current" ]; then
+            info "Kali mirror in use: $mirror (already configured)"
+            KALI_MIRROR_TEMPORARY=false
+            rm -f "$out" "$backup"
+            KALI_SOURCES_BACKUP=""
+            return 0
+        fi
+        info "Kali mirror in use for this run only: $mirror (sources.list restored when the run finishes)"
+        KALI_MIRROR_TEMPORARY=true
+        KALI_SOURCES_BACKUP="$backup"
+        rm -f "$out"
+        return 0
     done
 
     cp -a "$backup" /etc/apt/sources.list
     rm -f "$out" "$backup"
+    KALI_SOURCES_BACKUP=""
+    KALI_MIRROR_TEMPORARY=false
     warn "apt-get update had issues (see $APT_LOG)"
     _record_failure
     UPGRADE_OK=false
@@ -732,7 +806,7 @@ if $DRY_RUN; then
     info "DRY-RUN: Would release legacy apt holds (base-files, bash, util-linux, kernels)"
     info "DRY-RUN: Would run dpkg --configure -a"
     info "DRY-RUN: Would run apt-get install -f"
-    info "DRY-RUN: Would run apt-get update, retrying Kali mirrors on failure"
+    info "DRY-RUN: Would run apt-get update, preferring an HTTPS Kali mirror; HTTP mirrors are not saved"
 else
     refresh_kali_keyring || true
     release_legacy_holds
@@ -770,6 +844,8 @@ else
         _record_failure
         UPGRADE_OK=false
     fi
+
+    STILL_UPGRADABLE=$(apt list --upgradable 2>/dev/null | awk -F/ 'NR>1 && $1 != "" { print $1 }' || true)
 fi
 
 # ────────────────────────────────────────────────────────────────
@@ -968,9 +1044,25 @@ if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     notify-send "Kali Update" "$MSG" 2>/dev/null || true
 fi
 
+if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] && [ -n "${KALI_SOURCES_BACKUP:-}" ] && [ -f "$KALI_SOURCES_BACKUP" ]; then
+    info "Restoring the previous Kali mirror in /etc/apt/sources.list"
+    cp -a "$KALI_SOURCES_BACKUP" /etc/apt/sources.list
+    rm -f "$KALI_SOURCES_BACKUP"
+    KALI_SOURCES_BACKUP=""
+    KALI_MIRROR_TEMPORARY=false
+fi
+
 log "=== Update Summary ==="
 log "Disk space freed (/, /var, /boot): ${FREED_MB} MB"
 log "Failures recorded: $EXIT_CODE"
+if [ -n "${STILL_UPGRADABLE:-}" ]; then
+    log "Still upgradable (apt kept these back):"
+    while IFS= read -r pkg; do
+        [ -n "$pkg" ] && log "  $pkg"
+    done <<< "$STILL_UPGRADABLE"
+else
+    log "Still upgradable: none"
+fi
 log "Full log saved to: $LOG_FILE"
 log "APT warnings logged to: $APT_LOG"
 

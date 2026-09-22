@@ -5,6 +5,14 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.16] - 2026-09-22
+
+### Changed
+- Kali mirror selection tries `https://http.kali.org/kali` and `https://kali.download/kali` before the configured mirror. An HTTPS mirror that works is written to `/etc/apt/sources.list`. An HTTP fallback is used only until the run exits, then the previous file is restored.
+- A failed third-party repository no longer causes the Kali mirror line to change.
+- The run summary lists packages that are still upgradable after `full-upgrade`.
+- `systemd-resolved` being inactive is no longer a warning. A warning is logged only when `archive.kali.org` does not resolve.
+
 ## [5.15] - 2026-09-22
 
 ### Changed
