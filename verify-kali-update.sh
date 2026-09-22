@@ -48,6 +48,7 @@ Usage: ./verify-kali-update.sh [options]
 
 Runs local verification for kali-update.sh:
   - bash -n syntax check
+  - tests/security_regressions.sh
   - --version
   - --check (sudo if not root)
   - --dry-run (sudo if not root)
@@ -84,19 +85,23 @@ run_as_root() {
 info "=== kali-update verification ==="
 info "Script: $MAIN_SCRIPT"
 
-info "1/4 Syntax check (bash -n)..."
+info "1/5 Syntax check (bash -n)..."
 bash -n "$MAIN_SCRIPT"
 success "Syntax OK"
 
-info "2/4 Version..."
+info "2/5 Security regression tests..."
+bash "$SCRIPT_DIR/tests/security_regressions.sh"
+success "Security regression tests OK"
+
+info "3/5 Version..."
 "$MAIN_SCRIPT" --version
 success "Version OK"
 
-info "3/4 Pre-flight checks (--check)..."
+info "4/5 Pre-flight checks (--check)..."
 run_as_root "$MAIN_SCRIPT" --check
 success "Pre-flight checks OK"
 
-info "4/4 Dry-run (--dry-run)..."
+info "5/5 Dry-run (--dry-run)..."
 run_as_root "$MAIN_SCRIPT" --dry-run
 success "Dry-run OK"
 

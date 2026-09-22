@@ -19,7 +19,7 @@
 #
 # Usage: sudo ./kali-update.sh [--dry-run] [--no-kernel] [--help] [--version]
 # Recommended: run weekly
-# Configurable via env or /etc/kali-update.conf
+# Settings: environment or KEY=value files (not shell scripts). See load_config_files.
 
 set -euo pipefail
 set -o errtrace
@@ -28,6 +28,16 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
     printf '%s\n' "This script requires Bash 4+. Found: ${BASH_VERSION:-unknown}" >&2
     exit 1
 fi
+
+# Fixed command search path before any external command. Inherited PATH must
+# not choose apt-get, rm, gpg, or the other commands this script runs as root.
+_secure_path() {
+    export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+    hash -r 2>/dev/null || true
+    unset CDPATH || true
+    IFS=$' \t\n'
+}
+_secure_path
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -52,34 +62,237 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log()      { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
-success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-warn()     { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-error()    { echo -e "${RED}[ERROR]${NC} $1"; }
-
-load_config_files() {
-    local conf owner
-    for conf in /etc/kali-update.conf "$HOME/.config/kali-update.conf" "$HOME/.kali-update.conf"; do
-        [ -f "$conf" ] || continue
-        if [[ "$conf" == /etc/* ]]; then
-            owner=$(stat -c %u "$conf" 2>/dev/null || echo "invalid")
-            if ! [[ "$owner" =~ ^[0-9]+$ ]] || [ "$owner" != "0" ]; then
-                warn "Config $conf not owned by root (uid=$owner); skipping"
-                continue
-            fi
-        fi
-        # shellcheck source=/dev/null
-        source "$conf"
-    done
+# Drop terminal controls so repository or package text cannot rewrite the log.
+_strip_controls() {
+    local s=${1-}
+    printf '%s' "$s" | tr -d '\000-\010\013-\037\177'
 }
 
-load_config_files
+log()      { printf '%s\n' "[$(date '+%Y-%m-%d %H:%M:%S')] $(_strip_controls "${1-}")"; }
+info()     { printf '%b[INFO]%b %s\n' "$BLUE" "$NC" "$(_strip_controls "${1-}")"; }
+success()  { printf '%b[SUCCESS]%b %s\n' "$GREEN" "$NC" "$(_strip_controls "${1-}")"; }
+warn()     { printf '%b[WARNING]%b %s\n' "$YELLOW" "$NC" "$(_strip_controls "${1-}")"; }
+error()    { printf '%b[ERROR]%b %s\n' "$RED" "$NC" "$(_strip_controls "${1-}")"; }
 
-# Re-apply defaults so empty config values do not disable features
-LOG_RETENTION=${LOG_RETENTION:-3}
-KERNEL_KEEP=${KERNEL_KEEP:-2}
-CLEAN_DEV_CACHES=${CLEAN_DEV_CACHES:-true}
+# True when the numeric mode (from stat -c %a) has group or other write.
+_mode_group_or_world_writable() {
+    local mode="$1"
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 0
+    (( (8#$mode & 022) != 0 ))
+}
+
+# Regular file, not a symlink, not group/world writable, owned by an allowed uid.
+# Every parent directory up to / must match the same owner and mode rules.
+_config_file_trusted() {
+    local file="$1"
+    shift
+    local -a allowed=("$@")
+    local owner mode dir ok uid
+
+    [ -n "$file" ] || return 1
+    [ -L "$file" ] && return 1
+    [ -f "$file" ] || return 1
+    owner=$(stat -c %u -- "$file" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$file" 2>/dev/null) || return 1
+    if _mode_group_or_world_writable "$mode"; then
+        return 1
+    fi
+    ok=false
+    for uid in "${allowed[@]}"; do
+        [ "$owner" = "$uid" ] && ok=true && break
+    done
+    [ "$ok" = true ] || return 1
+
+    dir=$(dirname -- "$file")
+    while [ "$dir" != "/" ]; do
+        [ -L "$dir" ] && return 1
+        [ -d "$dir" ] || return 1
+        owner=$(stat -c %u -- "$dir" 2>/dev/null) || return 1
+        mode=$(stat -c %a -- "$dir" 2>/dev/null) || return 1
+        if _mode_group_or_world_writable "$mode"; then
+            return 1
+        fi
+        ok=false
+        for uid in "${allowed[@]}"; do
+            [ "$owner" = "$uid" ] && ok=true && break
+        done
+        [ "$ok" = true ] || return 1
+        dir=$(dirname -- "$dir")
+    done
+    owner=$(stat -c %u -- / 2>/dev/null) || return 1
+    mode=$(stat -c %a -- / 2>/dev/null) || return 1
+    [ "$owner" = 0 ] || return 1
+    _mode_group_or_world_writable "$mode" && return 1
+    return 0
+}
+
+# Passwd/NSS home used for cache cleanup and per-user config. Never $HOME.
+# Only a real directory /root or /home/<name>, with no symlink in the path.
+_validated_account_home() {
+    local user="$1"
+    local home resolved entry
+    [ -n "$user" ] || return 1
+    [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    entry=$(getent passwd "$user" 2>/dev/null | head -n 1 || true)
+    [ -n "$entry" ] || return 1
+    home=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $6 }')
+    [ -n "$home" ] || return 1
+    [[ "$home" != *$'\n'* ]] || return 1
+    [[ "$home" == /* ]] || return 1
+    [ "$home" != "/" ] || return 1
+    case "$home" in
+        *"/.."*|*"//"*|*/.|*/.) return 1 ;;
+    esac
+    [ -d "$home" ] || return 1
+    [ -L "$home" ] && return 1
+    resolved=$(readlink -f -- "$home" 2>/dev/null) || return 1
+    [ "$resolved" = "$home" ] || return 1
+    case "$resolved" in
+        /root) ;;
+        /home/*) [ "$resolved" != "/home" ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$resolved"
+}
+
+_config_candidates() {
+    local home
+    printf '%s\n' /etc/kali-update.conf
+    printf '%s\n' /root/.config/kali-update.conf
+    printf '%s\n' /root/.kali-update.conf
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        if home=$(_validated_account_home "$SUDO_USER"); then
+            printf '%s\n' "$home/.config/kali-update.conf"
+            printf '%s\n' "$home/.kali-update.conf"
+        fi
+    elif [ "$(id -u)" -ne 0 ]; then
+        if home=$(_validated_account_home "$(id -un)"); then
+            printf '%s\n' "$home/.config/kali-update.conf"
+            printf '%s\n' "$home/.kali-update.conf"
+        fi
+    fi
+}
+
+_apply_config_assignment() {
+    local key="$1" value="$2" conf="$3"
+    case "$key" in
+        LOG_RETENTION)
+            if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 100 ]; then
+                LOG_RETENTION=$value
+            else
+                warn "Ignoring invalid LOG_RETENTION in $conf"
+            fi
+            ;;
+        KERNEL_KEEP)
+            if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 0 ] && [ "$value" -le 50 ]; then
+                KERNEL_KEEP=$value
+            else
+                warn "Ignoring invalid KERNEL_KEEP in $conf"
+            fi
+            ;;
+        CLEAN_DEV_CACHES)
+            case "${value,,}" in
+                true|yes|on|1) CLEAN_DEV_CACHES=true ;;
+                false|no|off|0) CLEAN_DEV_CACHES=false ;;
+                *) warn "Ignoring invalid CLEAN_DEV_CACHES in $conf" ;;
+            esac
+            ;;
+        *)
+            warn "Ignoring unknown setting $key in $conf"
+            ;;
+    esac
+}
+
+# KEY=value only. Comments and a leading "export" are accepted. The file is
+# never sourced, so command substitution and other shell syntax do not run.
+_load_config_file() {
+    local conf="$1"
+    local line key raw value
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        [[ "$line" == *$'\n'* ]] && continue
+        line=${line#"${line%%[![:space:]]*}"}
+        [ -z "$line" ] && continue
+        [[ "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^export[[:space:]]+ ]]; then
+            line=${line#export}
+            line=${line#"${line%%[![:space:]]*}"}
+        fi
+        if [[ "$line" == *'`'* || "$line" == *'$('* || "$line" == *';'* ]]; then
+            warn "Ignoring unsafe config line in $conf"
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            warn "Ignoring invalid config line in $conf"
+            continue
+        fi
+        key=${BASH_REMATCH[1]}
+        raw=${BASH_REMATCH[2]}
+        if [[ "$raw" =~ ^\"([^\"]*)\"[[:space:]]*(#.*)?$ ]]; then
+            value=${BASH_REMATCH[1]}
+        elif [[ "$raw" =~ ^\'([^\']*)\'[[:space:]]*(#.*)?$ ]]; then
+            value=${BASH_REMATCH[1]}
+        elif [[ "$raw" =~ ^([^[:space:]#]+)[[:space:]]*(#.*)?$ ]]; then
+            value=${BASH_REMATCH[1]}
+        else
+            warn "Ignoring invalid value for $key in $conf"
+            continue
+        fi
+        _apply_config_assignment "$key" "$value" "$conf"
+    done < "$conf"
+}
+
+_validate_runtime_settings() {
+    if ! [[ "${LOG_RETENTION}" =~ ^[0-9]+$ ]] || [ "$LOG_RETENTION" -lt 1 ] || [ "$LOG_RETENTION" -gt 100 ]; then
+        warn "LOG_RETENTION is not an integer from 1 to 100; using 3"
+        LOG_RETENTION=3
+    fi
+    if ! [[ "${KERNEL_KEEP}" =~ ^[0-9]+$ ]] || [ "$KERNEL_KEEP" -lt 0 ] || [ "$KERNEL_KEEP" -gt 50 ]; then
+        warn "KERNEL_KEEP is not an integer from 0 to 50; using 2"
+        KERNEL_KEEP=2
+    fi
+    case "${CLEAN_DEV_CACHES,,}" in
+        true|yes|on|1) CLEAN_DEV_CACHES=true ;;
+        false|no|off|0) CLEAN_DEV_CACHES=false ;;
+        *)
+            warn "CLEAN_DEV_CACHES must be true or false; using true"
+            CLEAN_DEV_CACHES=true
+            ;;
+    esac
+}
+
+load_config_files() {
+    local conf uid
+    local -a allowed=() confs=()
+    mapfile -t confs < <(_config_candidates)
+    for conf in "${confs[@]}"; do
+        [ -e "$conf" ] || [ -L "$conf" ] || continue
+        if [ -L "$conf" ]; then
+            warn "Config $conf is a symlink; skipping"
+            continue
+        fi
+        [ -f "$conf" ] || continue
+        allowed=(0)
+        case "$conf" in
+            /etc/*|/root/*) ;;
+            *)
+                if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+                    uid=$(id -u "$SUDO_USER" 2>/dev/null || true)
+                else
+                    uid=$(id -u)
+                fi
+                [ -n "${uid:-}" ] && allowed+=("$uid")
+                ;;
+        esac
+        if ! _config_file_trusted "$conf" "${allowed[@]}"; then
+            warn "Config $conf failed ownership or permission checks; skipping"
+            continue
+        fi
+        _load_config_file "$conf"
+    done
+    _validate_runtime_settings
+    _secure_path
+}
 
 _record_failure() { EXIT_CODE=$((EXIT_CODE + 1)); }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
@@ -91,31 +304,70 @@ _is_truthy() {
     esac
 }
 
+# Delete one regenerable cache directory. The path must already be a real
+# directory exactly at <trusted home>/.cache/<name>, not a symlink.
+_safe_rm_cache_dir() {
+    local home="$1" cache="$2"
+    local dir resolved
+    case "$cache" in
+        pip|go-build|uv) ;;
+        *) return 1 ;;
+    esac
+    [ -n "$home" ] || return 1
+    [ "$home" != "/" ] || return 1
+    dir="${home}/.cache/${cache}"
+    if [ -L "$dir" ] || [ -L "${home}/.cache" ]; then
+        warn "Refusing to remove symlinked cache path $dir"
+        return 1
+    fi
+    [ -d "$dir" ] || return 1
+    resolved=$(readlink -f -- "$dir" 2>/dev/null) || return 1
+    [ "$resolved" = "$dir" ] || return 1
+    [ "$resolved" = "${home}/.cache/${cache}" ] || return 1
+    case "$resolved" in
+        /root/.cache/pip|/root/.cache/go-build|/root/.cache/uv) ;;
+        /home/*/.cache/pip|/home/*/.cache/go-build|/home/*/.cache/uv) ;;
+        *)
+            warn "Refusing to remove cache outside an expected home: $dir"
+            return 1
+            ;;
+    esac
+    rm -rf --one-file-system -- "$dir"
+}
+
 # Remove regenerable toolchain caches only (not GOPATH sources or project trees).
 clean_dev_caches() {
     local home dir cache size
     local -a homes=()
     local -a caches=(pip go-build uv)
 
-    homes+=("/root")
+    if home=$(_validated_account_home root); then
+        homes+=("$home")
+    fi
     if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-        home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
-        if [ -n "$home" ] && [ -d "$home" ]; then
+        if home=$(_validated_account_home "$SUDO_USER"); then
             homes+=("$home")
+        else
+            warn "Skipping cache cleanup for ${SUDO_USER}: home directory is not an expected path"
         fi
     fi
 
     for home in "${homes[@]}"; do
         for cache in "${caches[@]}"; do
             dir="$home/.cache/$cache"
-            [ -e "$dir" ] || continue
-            size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
-            if $DRY_RUN; then
-                info "DRY-RUN: Would remove $dir ($size)"
+            [ -e "$dir" ] || [ -L "$dir" ] || continue
+            if [ -L "$dir" ] || [ -L "$home/.cache" ]; then
+                warn "Refusing to remove symlinked cache path $dir"
                 continue
             fi
-            info "Removing regenerable cache $dir ($size)"
-            rm -rf "$dir" || warn "Failed to remove $dir"
+            [ -d "$dir" ] || continue
+            size=$(du -sh -- "$dir" 2>/dev/null | awk '{print $1}')
+            if $DRY_RUN; then
+                info "DRY-RUN: Would remove $dir (${size:-unknown})"
+                continue
+            fi
+            info "Removing regenerable cache $dir (${size:-unknown})"
+            _safe_rm_cache_dir "$home" "$cache" || warn "Failed to remove $dir"
         done
     done
 }
@@ -314,7 +566,7 @@ Options:
   --help, -h      Show this help
   --version, -v   Show version information
 
-Environment / Config:
+Environment / Config (KEY=value only, never shell code):
   LOG_RETENTION     Number of logs to keep (default: 3)
   KERNEL_KEEP       Kernels to keep besides running (default: 2)
   CLEAN_DEV_CACHES  Remove pip/go-build/uv caches (default: true)
@@ -418,6 +670,464 @@ run_preflight_checks() {
 
     echo "=== Checks complete ==="
 }
+
+# ────────────────────────────────────────────────────────────────
+# Helper for non-critical steps
+# ────────────────────────────────────────────────────────────────
+safe_run() {
+    local desc="$1"; shift
+    info "$desc"
+    if ! "$@"; then
+        warn "$desc failed — continuing"
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────
+# New helper functions for --version, --last, --check
+# ────────────────────────────────────────────────────────────────
+
+
+
+# ────────────────────────────────────────────────────────────────
+# Keyring (with signature verification)
+# ────────────────────────────────────────────────────────────────
+
+# Pinned bytes and primary-key fingerprints for archive.kali.org/archive-keyring.gpg
+# as published on 2026-09-22 (SHA-1 603374c107a90a69d983dbcb4d31e0d6eedfc325, the
+# checksum Kali documents). archive-keyring.gpg.asc does not exist (HTTP 404), so
+# a detached signature from the same host is not a trust anchor. A download is
+# installed only when its SHA-256 is pinned and every primary fingerprint is pinned,
+# including the 2025 archive signing key. Update these pins when Kali rotates the keyring.
+KALI_KEYRING_SHA256=(
+    "42a247ff5a26869e3739b6d3ad125938bb5da8e7bb43ed0791d2a190cd09c64f"
+)
+KALI_KEYRING_PRIMARY_FPRS=(
+    "827C8569F2518CC677FECA1AED65462EC8D5E4C5"
+    "44C6513A8E4FB3D30875F758ED444FF07D8D0BF6"
+)
+KALI_KEYRING_REQUIRED_FPR="827C8569F2518CC677FECA1AED65462EC8D5E4C5"
+KEYRING_PATH="${KEYRING_PATH:-/usr/share/keyrings/kali-archive-keyring.gpg}"
+
+# Ignore the caller's HOME and GNUPGHOME. gpg.conf there is not trusted.
+_gpg_batch() {
+    local home rc=0
+    home=$(mktemp -d) || return 1
+    chmod 700 "$home" || { rm -rf -- "$home"; return 1; }
+    GNUPGHOME="$home" gpg --batch --no-tty "$@" || rc=$?
+    rm -rf -- "$home"
+    return "$rc"
+}
+
+_keyring_primary_fprs() {
+    local file="$1"
+    local type fpr expect=false
+    while IFS=: read -r type _ _ _ _ _ _ _ _ fpr _; do
+        case "$type" in
+            pub|sec) expect=true ;;
+            sub|ssb) expect=false ;;
+            fpr)
+                if [ "$expect" = true ]; then
+                    printf '%s\n' "$fpr"
+                    expect=false
+                fi
+                ;;
+        esac
+    done < <(_gpg_batch --with-colons --no-default-keyring --keyring "$file" --fingerprint 2>/dev/null || true)
+}
+
+_keyring_fpr_allowed() {
+    local want="${1^^}" pin
+    for pin in "${KALI_KEYRING_PRIMARY_FPRS[@]}"; do
+        [ "${pin^^}" = "$want" ] && return 0
+    done
+    return 1
+}
+
+# SHA-256 pin plus primary fingerprints. gpg is required so a hash match is
+# also a keyring that contains the current Kali signing key and no other primary.
+_keyring_download_trusted() {
+    local file="$1"
+    local sum fpr pin ok=false count=0 saw_required=false
+    [ -n "$file" ] || return 1
+    [ -L "$file" ] && return 1
+    [ -s "$file" ] || return 1
+    has_cmd gpg || return 1
+    sum=$(sha256sum -- "$file" | awk 'NR==1 { print $1 }')
+    [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || return 1
+    for pin in "${KALI_KEYRING_SHA256[@]}"; do
+        [ "$pin" = "$sum" ] && ok=true && break
+    done
+    [ "$ok" = true ] || return 1
+    while IFS= read -r fpr; do
+        [ -n "$fpr" ] || continue
+        _keyring_fpr_allowed "$fpr" || return 1
+        count=$((count + 1))
+        [ "${fpr^^}" = "${KALI_KEYRING_REQUIRED_FPR^^}" ] && saw_required=true
+    done < <(_keyring_primary_fprs "$file")
+    [ "$count" -ge 1 ] && [ "$saw_required" = true ]
+}
+
+_atomic_install_keyring() {
+    local src="$1" dest="$2"
+    local dir tmp
+    [ -s "$src" ] || return 1
+    [ -L "$src" ] && return 1
+    dir=$(dirname -- "$dest")
+    [ -d "$dir" ] || return 1
+    [ -L "$dir" ] && return 1
+    [ -L "$dest" ] && return 1
+    tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
+    if ! install -m 0644 -o root -g root -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+# Download to a private temp file. The installed keyring is replaced only after
+# the pin check, and only by rename in the keyring directory.
+refresh_kali_keyring() {
+    local url tmp work
+    local -a urls=(
+        "https://archive.kali.org/archive-keyring.gpg"
+        "https://http.kali.org/kali/archive-keyring.gpg"
+        "https://kali.download/archive-keyring.gpg"
+    )
+
+    [ -n "${KEYRING_PATH:-}" ] || KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
+    info "Refreshing Kali archive keyring..."
+    if ! has_cmd gpg; then
+        warn "gpg not installed — refusing to replace the Kali keyring (install gnupg)"
+        if [ ! -s "$KEYRING_PATH" ] || [ -L "$KEYRING_PATH" ]; then
+            _record_failure
+        fi
+        return 1
+    fi
+    if ! has_cmd curl && ! has_cmd wget; then
+        warn "curl/wget not available — skipping keyring refresh"
+        if [ ! -s "$KEYRING_PATH" ] || [ -L "$KEYRING_PATH" ]; then
+            _record_failure
+        fi
+        return 1
+    fi
+    work=$(mktemp -d) || return 1
+    chmod 700 "$work"
+    tmp="$work/archive-keyring.gpg"
+    for url in "${urls[@]}"; do
+        rm -f -- "$tmp"
+        if has_cmd curl; then
+            curl -fsSL --retry 2 --retry-delay 2 "$url" -o "$tmp" || true
+        else
+            wget -qO "$tmp" "$url" || true
+        fi
+        if [ ! -s "$tmp" ]; then
+            warn "Keyring download failed: $url"
+            continue
+        fi
+        if ! _keyring_download_trusted "$tmp"; then
+            warn "Keyring from $url did not match the pinned Kali archive key — keeping the installed keyring"
+            continue
+        fi
+        if ! _atomic_install_keyring "$tmp" "$KEYRING_PATH"; then
+            warn "Failed to install the pinned keyring from $url — keeping the installed keyring"
+            _record_failure
+            rm -rf -- "$work"
+            return 1
+        fi
+        info "Pinned Kali archive keyring installed"
+        rm -rf -- "$work"
+        return 0
+    done
+    rm -rf -- "$work"
+    warn "Failed to install a pinned Kali keyring — keeping the installed keyring"
+    if [ ! -s "$KEYRING_PATH" ] || [ -L "$KEYRING_PATH" ]; then
+        _record_failure
+    fi
+    return 1
+}
+
+# apt-get update exits 0 when only some indexes fail. A Kali miss retries
+# mirrors. HTTPS mirrors may be saved. An HTTP fallback is used only for this
+# run, then the previous sources.list is restored. A third-party repo failure
+# (Proton, for example) does not change the Kali line.
+KALI_MIRROR_HTTPS=(
+    "https://http.kali.org/kali"
+    "https://kali.download/kali"
+)
+KALI_MIRROR_HTTP=(
+    "http://ftp.halifax.rwth-aachen.de/kali"
+    "http://mirror.math.princeton.edu/pub/kali"
+)
+UPGRADE_OK=true
+KALI_SOURCES_LIST="${KALI_SOURCES_LIST:-/etc/apt/sources.list}"
+KALI_SOURCES_BACKUP=""
+KALI_MIRROR_TEMPORARY=false
+STILL_UPGRADABLE=""
+
+# Same-directory temp file plus rename, so a crash cannot leave a truncated dest.
+# Refuses a symlink at the destination. Copies owner and mode from dest when it exists.
+_atomic_replace_file() {
+    local src="$1" dest="$2"
+    local dir tmp
+    [ -n "$src" ] && [ -n "$dest" ] || return 1
+    [ -L "$src" ] && return 1
+    [ -s "$src" ] || return 1
+    [ -L "$dest" ] && return 1
+    dir=$(dirname -- "$dest")
+    [ -d "$dir" ] || return 1
+    [ -L "$dir" ] && return 1
+    tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
+    if ! cp -a -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ -f "$dest" ]; then
+        if ! chown --reference="$dest" -- "$tmp" || ! chmod --reference="$dest" -- "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    else
+        chmod 0644 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+    fi
+    if ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+_kali_sources_ok() {
+    local file="$1"
+    [ -s "$file" ] || return 1
+    [ -L "$file" ] && return 1
+    # Reject NULs and other controls. A bracket expression cannot express NUL in grep.
+    if ! cmp -s -- "$file" <(tr -d '\000-\010\013-\037\177' < "$file"); then
+        return 1
+    fi
+    grep -E -q '^[[:space:]]*deb[[:space:]]+https?://[^[:space:]]+/kali[[:space:]]' "$file"
+}
+
+_write_kali_mirror() {
+    local backup="$1" mirror="$2" dest="$3"
+    local tmp
+    [[ "$mirror" =~ ^https?://[A-Za-z0-9._~:/?#@%+-]+/kali$ ]] || return 1
+    tmp=$(mktemp "$(dirname -- "$dest")/.sources.list.new.XXXXXX") || return 1
+    if ! sed -E "s#https?://[^[:space:]]+/kali#${mirror}#g" "$backup" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! _kali_sources_ok "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! _atomic_replace_file "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    rm -f -- "$tmp"
+    return 0
+}
+
+# Put back the pre-fallback sources.list. On failure the backup is kept and
+# the run is a failure so an HTTP mirror is not reported as a clean exit.
+restore_temporary_kali_sources() {
+    local backup
+    [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] || return 0
+    backup="${KALI_SOURCES_BACKUP:-}"
+    if [ -z "$backup" ] || [ ! -f "$backup" ] || [ -L "$backup" ]; then
+        warn "HTTP mirror fallback is active but the sources.list backup is missing"
+        _record_failure
+        return 1
+    fi
+    if ! _kali_sources_ok "$backup"; then
+        warn "Refusing to restore $KALI_SOURCES_LIST from an invalid backup ($backup)"
+        _record_failure
+        return 1
+    fi
+    if ! _atomic_replace_file "$backup" "$KALI_SOURCES_LIST"; then
+        warn "Failed to restore $KALI_SOURCES_LIST (backup kept at $backup)"
+        _record_failure
+        return 1
+    fi
+    rm -f -- "$backup"
+    KALI_SOURCES_BACKUP=""
+    KALI_MIRROR_TEMPORARY=false
+    return 0
+}
+
+cleanup() {
+    trap - INT TERM EXIT ERR
+    local rc=${1:-$?}
+    if [ "${AUTOREMOVE_HOLD_ACTIVE:-false}" = true ]; then
+        apt-mark unhold base-files base-passwd bash coreutils util-linux ${RUNNING_KIMG_HELD:-} >/dev/null 2>&1 || true
+    fi
+    if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ]; then
+        if ! restore_temporary_kali_sources; then
+            if [ "$rc" -eq 0 ]; then
+                rc=1
+            fi
+        fi
+    fi
+    sync 2>/dev/null || true
+    if [ -n "${LOCKFILE:-}" ]; then
+        flock -u 200 2>/dev/null || true
+        exec 200>&- 2>/dev/null || true
+        rm -f -- "$LOCKFILE" 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+
+_kali_fetch_failed() {
+    local outfile="$1"
+    grep -E -q 'Failed to fetch https?://[^[:space:]]*kali[^[:space:]]*' "$outfile"
+}
+
+_current_kali_mirror() {
+    awk '/^[[:space:]]*deb[[:space:]]/ && $2 ~ /\/kali$/ { print $2; exit }' "$KALI_SOURCES_LIST" 2>/dev/null || true
+}
+
+_mirror_already_listed() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+apt_get_update_with_fallback() {
+    local out rc mirror backup current
+    local -a order=()
+
+    out=$(mktemp)
+    if [ -L "$KALI_SOURCES_LIST" ]; then
+        rm -f "$out"
+        warn "Refusing to update symlinked $KALI_SOURCES_LIST"
+        _record_failure
+        UPGRADE_OK=false
+        return 1
+    fi
+    if [ ! -f "$KALI_SOURCES_LIST" ]; then
+        rm -f "$out"
+        warn "No $KALI_SOURCES_LIST; cannot update Kali"
+        _record_failure
+        UPGRADE_OK=false
+        return 1
+    fi
+    if ! grep -E -q '^[[:space:]]*deb[[:space:]]+https?://[^[:space:]]+/kali[[:space:]]' "$KALI_SOURCES_LIST"; then
+        rm -f "$out"
+        warn "No Kali deb line in $KALI_SOURCES_LIST"
+        _record_failure
+        UPGRADE_OK=false
+        return 1
+    fi
+
+    backup=$(mktemp "$(dirname -- "$KALI_SOURCES_LIST")/.kali-update-sources.XXXXXX")
+    cp -a -- "$KALI_SOURCES_LIST" "$backup"
+    current=$(_current_kali_mirror)
+
+    # Official HTTPS first, unless that is already the configured mirror
+    # (then try it before the other HTTPS mirror). HTTP stays last.
+    if [[ "$current" == https://* ]]; then
+        order+=("$current")
+    fi
+    for mirror in "${KALI_MIRROR_HTTPS[@]}"; do
+        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
+        order+=("$mirror")
+    done
+    if [ -n "$current" ]; then
+        _mirror_already_listed "$current" "${order[@]+"${order[@]}"}" || order+=("$current")
+    fi
+    for mirror in "${KALI_MIRROR_HTTP[@]}"; do
+        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
+        order+=("$mirror")
+    done
+
+    info "Updating package lists..."
+    for mirror in "${order[@]}"; do
+        if ! _write_kali_mirror "$backup" "$mirror" "$KALI_SOURCES_LIST"; then
+            warn "Refusing to switch Kali mirror to $mirror"
+            _record_failure
+            UPGRADE_OK=false
+            KALI_MIRROR_TEMPORARY=true
+            KALI_SOURCES_BACKUP="$backup"
+            restore_temporary_kali_sources || true
+            rm -f "$out"
+            return 1
+        fi
+        if [ "$mirror" != "$current" ]; then
+            info "Trying Kali mirror $mirror"
+        fi
+        : >"$out"
+        rc=0
+        apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
+        if _kali_fetch_failed "$out"; then
+            warn "Mirror $mirror did not serve the Kali index"
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
+            warn "A non-Kali repository failed during apt-get update; keeping Kali mirror $mirror"
+        fi
+        if [[ "$mirror" == https://* ]]; then
+            info "Kali mirror in use: $mirror (saved to $KALI_SOURCES_LIST)"
+            KALI_MIRROR_TEMPORARY=false
+            rm -f "$out" "$backup"
+            KALI_SOURCES_BACKUP=""
+            return 0
+        fi
+        if [ "$mirror" = "$current" ]; then
+            info "Kali mirror in use: $mirror (already configured)"
+            KALI_MIRROR_TEMPORARY=false
+            rm -f "$out" "$backup"
+            KALI_SOURCES_BACKUP=""
+            return 0
+        fi
+        info "Kali mirror in use for this run only: $mirror ($KALI_SOURCES_LIST restored when the run finishes)"
+        KALI_MIRROR_TEMPORARY=true
+        KALI_SOURCES_BACKUP="$backup"
+        rm -f "$out"
+        return 0
+    done
+
+    KALI_MIRROR_TEMPORARY=true
+    KALI_SOURCES_BACKUP="$backup"
+    if ! restore_temporary_kali_sources; then
+        warn "apt-get update had issues and $KALI_SOURCES_LIST could not be restored (see $APT_LOG)"
+    else
+        warn "apt-get update had issues (see $APT_LOG)"
+    fi
+    rm -f "$out"
+    _record_failure
+    UPGRADE_OK=false
+    return 1
+}
+
+# Permanent holds block upgrades (util-linux on hold keeps the whole 2.42
+# stack "kept back"). Drop holds this script used to leave behind. A short
+# hold around autoremove is applied and released later.
+release_legacy_holds() {
+    local pkg
+    info "Releasing holds that block upgrades..."
+    apt-mark unhold base-files base-passwd bash coreutils util-linux 2>/dev/null || true
+    while IFS= read -r pkg; do
+        [ -n "$pkg" ] || continue
+        apt-mark unhold "$pkg" 2>/dev/null || true
+        info "Unheld $pkg"
+    done < <(apt-mark showhold 2>/dev/null | grep -E '^(linux-image|linux-binary)-' || true)
+}
+
+# ────────────────────────────────────────────────────────────────
+# Sourcing for tests stops here. A normal run loads KEY=value config next.
+# ────────────────────────────────────────────────────────────────
+if [ "${KALI_UPDATE_SOURCE_ONLY:-}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+load_config_files
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)
@@ -563,239 +1273,9 @@ if ! flock -n 200; then
     error "Another instance of kali-update is already running."
     exit 1
 fi
-cleanup() {
-    trap - INT TERM EXIT ERR
-    local rc=${1:-$?}
-    if [ "${AUTOREMOVE_HOLD_ACTIVE:-false}" = true ]; then
-        apt-mark unhold base-files base-passwd bash coreutils util-linux ${RUNNING_KIMG_HELD:-} >/dev/null 2>&1 || true
-    fi
-    if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] && [ -n "${KALI_SOURCES_BACKUP:-}" ] && [ -f "$KALI_SOURCES_BACKUP" ]; then
-        cp -a "$KALI_SOURCES_BACKUP" /etc/apt/sources.list 2>/dev/null || true
-        rm -f "$KALI_SOURCES_BACKUP"
-        KALI_MIRROR_TEMPORARY=false
-    fi
-    sync 2>/dev/null || true
-    flock -u 200 2>/dev/null || true
-    exec 200>&- 2>/dev/null || true
-    rm -f "$LOCKFILE" 2>/dev/null || true
-    exit "$rc"
-}
+
 
 trap 'cleanup $?' INT TERM EXIT
-
-# ────────────────────────────────────────────────────────────────
-# Helper for non-critical steps
-# ────────────────────────────────────────────────────────────────
-safe_run() {
-    local desc="$1"; shift
-    info "$desc"
-    if ! "$@"; then
-        warn "$desc failed — continuing"
-    fi
-}
-
-# ────────────────────────────────────────────────────────────────
-# New helper functions for --version, --last, --check
-# ────────────────────────────────────────────────────────────────
-
-
-
-# ────────────────────────────────────────────────────────────────
-# Keyring (with signature verification)
-# ────────────────────────────────────────────────────────────────
-
-# Download to a temp file. curl -o on the live keyring truncates it when the
-# connection resets, which is worse than keeping the previous keyring.
-refresh_kali_keyring() {
-    local url tmp asc_tmp fetcher=ok
-    KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
-    local -a urls=(
-        "https://archive.kali.org/archive-keyring.gpg"
-        "https://http.kali.org/kali/archive-keyring.gpg"
-        "https://kali.download/archive-keyring.gpg"
-    )
-
-    info "Refreshing Kali archive keyring..."
-    tmp=$(mktemp)
-    asc_tmp=$(mktemp)
-    for url in "${urls[@]}"; do
-        fetcher=fail
-        if has_cmd curl; then
-            curl -fsSL --retry 2 --retry-delay 2 "$url" -o "$tmp" && fetcher=ok
-        elif has_cmd wget; then
-            wget -qO "$tmp" "$url" && fetcher=ok
-        else
-            warn "curl/wget not available — skipping keyring refresh"
-            rm -f "$tmp" "$asc_tmp"
-            return 0
-        fi
-        if [ "$fetcher" = ok ] && [ -s "$tmp" ]; then
-            info "Keyring downloaded from $url"
-            install -m 0644 "$tmp" "$KEYRING_PATH"
-            if has_cmd curl; then
-                curl -fsSL --retry 2 --retry-delay 2 "${url}.asc" -o "$asc_tmp" 2>/dev/null || true
-            elif has_cmd wget; then
-                wget -qO "$asc_tmp" "${url}.asc" 2>/dev/null || true
-            fi
-            if [ -s "$asc_tmp" ] && has_cmd gpg; then
-                if gpg --verify "$asc_tmp" "$KEYRING_PATH" >/dev/null 2>&1; then
-                    info "Keyring signature verified successfully"
-                else
-                    warn "Keyring signature verification failed — installed keyring kept"
-                fi
-            elif ! has_cmd gpg; then
-                warn "gpg not installed, skipping signature verification (install gnupg for better security)"
-            fi
-            rm -f "$tmp" "$asc_tmp"
-            return 0
-        fi
-        warn "Keyring download failed: $url"
-    done
-    rm -f "$tmp" "$asc_tmp"
-    warn "Failed to download keyring from every mirror — keeping the installed keyring"
-    if [ ! -s "$KEYRING_PATH" ]; then
-        _record_failure
-    fi
-    return 1
-}
-
-# apt-get update exits 0 when only some indexes fail. A Kali miss retries
-# mirrors. HTTPS mirrors may be saved. An HTTP fallback is used only for this
-# run, then the previous sources.list is restored. A third-party repo failure
-# (Proton, for example) does not change the Kali line.
-KALI_MIRROR_HTTPS=(
-    "https://http.kali.org/kali"
-    "https://kali.download/kali"
-)
-KALI_MIRROR_HTTP=(
-    "http://ftp.halifax.rwth-aachen.de/kali"
-    "http://mirror.math.princeton.edu/pub/kali"
-)
-UPGRADE_OK=true
-KALI_SOURCES_BACKUP=""
-KALI_MIRROR_TEMPORARY=false
-STILL_UPGRADABLE=""
-
-_kali_fetch_failed() {
-    local outfile="$1"
-    grep -E -q 'Failed to fetch https?://[^[:space:]]*kali[^[:space:]]*' "$outfile"
-}
-
-_current_kali_mirror() {
-    awk '/^[[:space:]]*deb[[:space:]]/ && $2 ~ /\/kali$/ { print $2; exit }' /etc/apt/sources.list 2>/dev/null || true
-}
-
-_mirror_already_listed() {
-    local needle="$1"
-    shift
-    local item
-    for item in "$@"; do
-        [ "$item" = "$needle" ] && return 0
-    done
-    return 1
-}
-
-apt_get_update_with_fallback() {
-    local out rc mirror backup current
-    local -a order=()
-
-    out=$(mktemp)
-    if [ ! -f /etc/apt/sources.list ]; then
-        rm -f "$out"
-        warn "No /etc/apt/sources.list; cannot update Kali"
-        _record_failure
-        UPGRADE_OK=false
-        return 1
-    fi
-    if ! grep -E -q '^[[:space:]]*deb[[:space:]]+https?://[^[:space:]]+/kali[[:space:]]' /etc/apt/sources.list; then
-        rm -f "$out"
-        warn "No Kali deb line in /etc/apt/sources.list"
-        _record_failure
-        UPGRADE_OK=false
-        return 1
-    fi
-
-    backup=$(mktemp)
-    cp -a /etc/apt/sources.list "$backup"
-    current=$(_current_kali_mirror)
-
-    # Official HTTPS first, unless that is already the configured mirror
-    # (then try it before the other HTTPS mirror). HTTP stays last.
-    if [[ "$current" == https://* ]]; then
-        order+=("$current")
-    fi
-    for mirror in "${KALI_MIRROR_HTTPS[@]}"; do
-        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
-        order+=("$mirror")
-    done
-    if [ -n "$current" ]; then
-        _mirror_already_listed "$current" "${order[@]+"${order[@]}"}" || order+=("$current")
-    fi
-    for mirror in "${KALI_MIRROR_HTTP[@]}"; do
-        _mirror_already_listed "$mirror" "${order[@]+"${order[@]}"}" && continue
-        order+=("$mirror")
-    done
-
-    info "Updating package lists..."
-    for mirror in "${order[@]}"; do
-        sed -E "s#https?://[^[:space:]]+/kali#${mirror}#g" "$backup" > /etc/apt/sources.list
-        if [ "$mirror" != "$current" ]; then
-            info "Trying Kali mirror $mirror"
-        fi
-        : >"$out"
-        rc=0
-        apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
-        if _kali_fetch_failed "$out"; then
-            warn "Mirror $mirror did not serve the Kali index"
-            continue
-        fi
-        if [ "$rc" -ne 0 ]; then
-            warn "A non-Kali repository failed during apt-get update; keeping Kali mirror $mirror"
-        fi
-        if [[ "$mirror" == https://* ]]; then
-            info "Kali mirror in use: $mirror (saved to /etc/apt/sources.list)"
-            KALI_MIRROR_TEMPORARY=false
-            rm -f "$out" "$backup"
-            KALI_SOURCES_BACKUP=""
-            return 0
-        fi
-        if [ "$mirror" = "$current" ]; then
-            info "Kali mirror in use: $mirror (already configured)"
-            KALI_MIRROR_TEMPORARY=false
-            rm -f "$out" "$backup"
-            KALI_SOURCES_BACKUP=""
-            return 0
-        fi
-        info "Kali mirror in use for this run only: $mirror (sources.list restored when the run finishes)"
-        KALI_MIRROR_TEMPORARY=true
-        KALI_SOURCES_BACKUP="$backup"
-        rm -f "$out"
-        return 0
-    done
-
-    cp -a "$backup" /etc/apt/sources.list
-    rm -f "$out" "$backup"
-    KALI_SOURCES_BACKUP=""
-    KALI_MIRROR_TEMPORARY=false
-    warn "apt-get update had issues (see $APT_LOG)"
-    _record_failure
-    UPGRADE_OK=false
-    return 1
-}
-
-# Permanent holds block upgrades (util-linux on hold keeps the whole 2.42
-# stack "kept back"). Drop holds this script used to leave behind. A short
-# hold around autoremove is applied and released later.
-release_legacy_holds() {
-    local pkg
-    info "Releasing holds that block upgrades..."
-    apt-mark unhold base-files base-passwd bash coreutils util-linux 2>/dev/null || true
-    while IFS= read -r pkg; do
-        [ -n "$pkg" ] || continue
-        apt-mark unhold "$pkg" 2>/dev/null || true
-        info "Unheld $pkg"
-    done < <(apt-mark showhold 2>/dev/null | grep -E '^(linux-image|linux-binary)-' || true)
-}
 
 # ────────────────────────────────────────────────────────────────
 # Core update
@@ -1044,12 +1524,9 @@ if command -v notify-send >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     notify-send "Kali Update" "$MSG" 2>/dev/null || true
 fi
 
-if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] && [ -n "${KALI_SOURCES_BACKUP:-}" ] && [ -f "$KALI_SOURCES_BACKUP" ]; then
-    info "Restoring the previous Kali mirror in /etc/apt/sources.list"
-    cp -a "$KALI_SOURCES_BACKUP" /etc/apt/sources.list
-    rm -f "$KALI_SOURCES_BACKUP"
-    KALI_SOURCES_BACKUP=""
-    KALI_MIRROR_TEMPORARY=false
+if [ "${KALI_MIRROR_TEMPORARY:-false}" = true ]; then
+    info "Restoring the previous Kali mirror in $KALI_SOURCES_LIST"
+    restore_temporary_kali_sources || true
 fi
 
 log "=== Update Summary ==="

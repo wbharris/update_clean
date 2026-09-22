@@ -5,6 +5,16 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.17] - 2026-09-22
+
+### Fixed
+- The Kali archive keyring is no longer installed before it is checked. A download replaces `/usr/share/keyrings/kali-archive-keyring.gpg` only when its SHA-256 and primary key fingerprints match the pins in the script (the 2025 archive signing key must be present). `archive-keyring.gpg.asc` is not published (HTTP 404), so a signature fetched from the same host is not treated as proof. `gpg` is required and runs with a private `GNUPGHOME`, so `HOME` cannot supply `gpg.conf`. The file is written to a temporary name in the keyring directory and renamed into place.
+- Configuration files are parsed as `KEY=value` assignments. They are not sourced. `/etc/kali-update.conf` and root config files must be regular files owned by root, mode `0644` or stricter (no group or world write), and not symlinks. Parent directories must meet the same owner and mode rules. Per-user files use the account's passwd home, not `$HOME`.
+- `PATH` is set to `/usr/sbin:/usr/bin:/sbin:/bin` before external commands run, and again after configuration is loaded.
+- Replacing `/etc/apt/sources.list` and restoring it after an HTTP mirror fallback uses a same-directory temporary file and `mv`. A failed restore keeps the backup, records a failure, and the script does not report success. The exit trap uses the same restore path, including when the run is interrupted.
+- Regenerable cache deletion accepts only a real directory at `/root/.cache/{pip,go-build,uv}` or `/home/<user>/.cache/...`. Symlinks, `/`, and other homes are refused.
+- Log lines use `printf` and strip control characters before they are written.
+
 ## [5.16] - 2026-09-22
 
 ### Changed

@@ -11,7 +11,7 @@ One clean update & cleanup script for Kali Linux.
 ### What it does
 
 **Update:**
-- Refreshes Kali keyring (with GPG verification)
+- Refreshes the Kali keyring only when the download matches the pinned archive keyring (SHA-256 and key fingerprints)
 - Fixes interrupted installs and broken packages
 - `apt update`
 - Package cache check (`apt-get check`)
@@ -63,11 +63,13 @@ Run periodically (recommended weekly).
 
 ### Configuration
 
-Optional config files (first found wins per path order):
+Optional `KEY=value` files (not shell scripts). Unknown keys and shell syntax are ignored.
 
-- `/etc/kali-update.conf` (must be root-owned)
-- `~/.config/kali-update.conf`
-- `~/.kali-update.conf`
+- `/etc/kali-update.conf` — regular file, root-owned, mode `0644` or stricter, not a symlink; `/etc` must be root-owned and not group/world writable
+- `/root/.config/kali-update.conf` and `/root/.kali-update.conf` — same rules
+- When started with `sudo`, the invoking account's `~/.config/kali-update.conf` and `~/.kali-update.conf`, using that account's passwd home (not `$HOME`). The file must be owned by that user or root and must not be group/world writable.
+
+`PATH` inside the script is `/usr/sbin:/usr/bin:/sbin:/bin`.
 
 Variables:
 
