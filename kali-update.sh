@@ -120,13 +120,26 @@ clean_dev_caches() {
     done
 }
 
+# Versioned kernel packages only. '-' sits at the end of the class so it is
+# literal (a mid-class '-' makes grep abort with "Invalid range end").
+# Kali ships both linux-image-VERSION and linux-binary-VERSION.
+_KERNEL_PKG_RE='^(linux-image(-unsigned)?|linux-binary)-[0-9][0-9A-Za-z.+-]*$'
+
 list_installed_kernel_images() {
-    dpkg-query -W -f='${Status}\t${Package}\n' 'linux-image-*' 2>/dev/null \
-        | awk -F'\t' '$1 ~ /^install ok installed/ {print $2}' \
-        | grep -E '^linux-image(-unsigned)?-[0-9][0-9a-zA-Z.\-+]*' \
+    dpkg-query -W -f='${Status}\t${Package}\n' 'linux-image-*' 'linux-binary-*' 2>/dev/null \
+        | awk -F'\t' '$1 ~ /^(install|hold) ok installed/ {print $2}' \
+        | grep -E "$_KERNEL_PKG_RE" \
         | grep -Ev -- '-(meta|dbg|dbgsym|rt|cloud|kvm|virtual)$' \
-        | grep -Ev 'linux-image-(generic|generic-hwe|amd64)(-lts|-hwe)?$' \
         | sort -V
+}
+
+kernel_pkg_version() {
+    local pkg="$1"
+    if [[ "$pkg" =~ ^linux-image-unsigned-(.+)$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$pkg" =~ ^linux-(image|binary)-(.+)$ ]]; then
+        printf '%s' "${BASH_REMATCH[2]}"
+    fi
 }
 
 find_running_kernel_pkg() {
@@ -161,38 +174,50 @@ find_running_kernel_pkg() {
 
 purge_kernel_related() {
     local pkg="$1"
-    local ver suffix candidate related
+    local ver suffix candidate related sibling
 
-    if [[ "$pkg" =~ ^linux-image-(.+)$ ]]; then
-        ver="${BASH_REMATCH[1]}"
-        for suffix in headers modules-extra modules modules-unsigned; do
-            candidate="linux-${suffix}-${ver}"
-            if dpkg-query -W -f='${Status}' "$candidate" 2>/dev/null | grep -q 'install ok installed'; then
-                if $DRY_RUN; then
-                    info "DRY-RUN: Would purge $candidate"
-                else
-                    apt-get purge -y "$candidate" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
-                fi
-            fi
-        done
-        while IFS= read -r related; do
-            [ -z "$related" ] || [ "$related" = "$pkg" ] && continue
+    ver=$(kernel_pkg_version "$pkg")
+    [ -n "$ver" ] || return 0
+
+    for sibling in "linux-image-${ver}" "linux-image-unsigned-${ver}" "linux-binary-${ver}"; do
+        [ "$sibling" = "$pkg" ] && continue
+        if dpkg-query -W -f='${Status}' "$sibling" 2>/dev/null | grep -q 'install ok installed'; then
             if $DRY_RUN; then
-                info "DRY-RUN: Would purge $related"
+                info "DRY-RUN: Would purge $sibling"
             else
-                apt-get purge -y "$related" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
+                apt-mark unhold "$sibling" 2>/dev/null || true
+                apt-get purge -y "$sibling" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
             fi
-        done < <(
-            dpkg-query -W -f='${Package}\n' 2>/dev/null \
-                | grep -E '^linux-(headers|modules)' \
-                | grep -F -- "$ver" || true
-        )
-    fi
+        fi
+    done
+
+    for suffix in headers modules-extra modules modules-unsigned; do
+        candidate="linux-${suffix}-${ver}"
+        if dpkg-query -W -f='${Status}' "$candidate" 2>/dev/null | grep -q 'install ok installed'; then
+            if $DRY_RUN; then
+                info "DRY-RUN: Would purge $candidate"
+            else
+                apt-get purge -y "$candidate" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
+            fi
+        fi
+    done
+    while IFS= read -r related; do
+        [ -z "$related" ] || [ "$related" = "$pkg" ] && continue
+        if $DRY_RUN; then
+            info "DRY-RUN: Would purge $related"
+        else
+            apt-get purge -y "$related" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || true
+        fi
+    done < <(
+        dpkg-query -W -f='${Package}\n' 2>/dev/null \
+            | grep -E '^linux-(headers|modules)' \
+            | grep -F -- "$ver" || true
+    )
 }
 
 remove_old_kernels() {
-    local -a kernels=() to_remove=()
-    local running_pkg running_ver pkg delcount keep boot_kb
+    local -a kernels=() versions=() old_versions=()
+    local running_pkg running_ver pkg ver delcount keep boot_kb seen
 
     if [ -d /boot ]; then
         boot_kb=$(df -B 1K /boot 2>/dev/null | awk 'NR==2 {print $4+0}')
@@ -206,6 +231,9 @@ remove_old_kernels() {
 
     running_ver=$(uname -r 2>/dev/null || true)
     running_pkg=$(find_running_kernel_pkg "$running_ver" "${kernels[@]}" || true)
+    if [ -z "$running_ver" ] && [ -n "$running_pkg" ]; then
+        running_ver=$(kernel_pkg_version "$running_pkg")
+    fi
 
     if [ -n "$running_pkg" ]; then
         info "Running kernel package: $running_pkg ($running_ver)"
@@ -215,46 +243,59 @@ remove_old_kernels() {
     fi
 
     if [ "${#kernels[@]}" -eq 0 ]; then
-        info "No linux-image packages found."
+        info "No versioned linux-image or linux-binary packages found."
         return 0
     fi
 
+    seen=" "
     for pkg in "${kernels[@]}"; do
-        if [ -n "$running_pkg" ] && [ "$pkg" = "$running_pkg" ]; then
+        ver=$(kernel_pkg_version "$pkg")
+        [ -n "$ver" ] || continue
+        [[ "$seen" == *" $ver "* ]] && continue
+        seen+="$ver "
+        if [ -n "$running_ver" ] && [ "$ver" = "$running_ver" ]; then
             continue
         fi
-        if [ -n "$running_ver" ] && [[ "$pkg" == *"$running_ver"* ]]; then
-            continue
-        fi
-        to_remove+=("$pkg")
+        versions+=("$ver")
     done
 
+    if [ "${#versions[@]}" -eq 0 ]; then
+        info "No old kernels to remove (only the running kernel is installed)."
+        return 0
+    fi
+
+    mapfile -t old_versions < <(printf '%s\n' "${versions[@]}" | sort -V)
+
     keep="${KERNEL_KEEP:-2}"
-    if [ "${#to_remove[@]}" -le "$keep" ]; then
+    if [ "${#old_versions[@]}" -le "$keep" ]; then
         info "No old kernels to remove (keeping $keep beside running kernel)."
         return 0
     fi
 
-    delcount=$(( ${#to_remove[@]} - keep ))
-    if [ "$delcount" -lt 1 ] || [ "$delcount" -gt "${#to_remove[@]}" ]; then
+    delcount=$(( ${#old_versions[@]} - keep ))
+    if [ "$delcount" -lt 1 ] || [ "$delcount" -gt "${#old_versions[@]}" ]; then
         warn "Kernel removal count out of range; skipping"
         return 0
     fi
 
     KERNELS_REMOVED=true
-    info "Kernels scheduled for removal ($delcount):"
-    for pkg in "${to_remove[@]:0:delcount}"; do
-        info "  $pkg"
+    info "Kernel versions scheduled for removal ($delcount):"
+    for ver in "${old_versions[@]:0:delcount}"; do
+        info "  $ver"
     done
 
-    for pkg in "${to_remove[@]:0:delcount}"; do
-        if $DRY_RUN; then
-            info "DRY-RUN: Would purge old kernel: $pkg"
-            continue
-        fi
-        info "Purging old kernel: $pkg"
-        apt-get purge -y "$pkg" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || warn "Failed to purge $pkg"
-        purge_kernel_related "$pkg"
+    for ver in "${old_versions[@]:0:delcount}"; do
+        for pkg in "${kernels[@]}"; do
+            [ "$(kernel_pkg_version "$pkg")" = "$ver" ] || continue
+            if $DRY_RUN; then
+                info "DRY-RUN: Would purge old kernel: $pkg"
+                continue
+            fi
+            info "Purging old kernel: $pkg"
+            apt-mark unhold "$pkg" 2>/dev/null || true
+            apt-get purge -y "$pkg" 2>&1 | tee -a "${APT_LOG:-/dev/null}" || warn "Failed to purge $pkg"
+            purge_kernel_related "$pkg"
+        done
     done
 }
 
@@ -423,10 +464,20 @@ exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 log "Running kali-update version: $VERSION"
 
-# Keep only the last N log files (improved for safety, null-delimited)
+# Keep the last N main logs and the matching apt-warnings sidecars.
+# Orphan *.apt-warnings (main log already gone) are removed too.
 log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
-find "$LOG_DIR" -name "kali-update-*.log" -type f -printf '%T@ %p\0' | \
-    sort -z -n | head -zn "-$LOG_RETENTION" | cut -zd' ' -f2- | xargs -0r rm -f
+while IFS= read -r oldlog; do
+    [ -n "$oldlog" ] || continue
+    rm -f "$oldlog" "${oldlog}.apt-warnings"
+done < <(
+    find "$LOG_DIR" -name 'kali-update-*.log' -type f -printf '%T@ %p\n' \
+        | sort -n | head -n "-${LOG_RETENTION}" | cut -d' ' -f2-
+)
+for sidecar in "$LOG_DIR"/kali-update-*.log.apt-warnings; do
+    [ -e "$sidecar" ] || continue
+    [ -f "${sidecar%.apt-warnings}" ] || rm -f "$sidecar"
+done
 
 SCRIPT_START=$(date +%s)
 if [ -f /var/run/reboot-required ]; then
@@ -508,6 +559,9 @@ fi
 cleanup() {
     trap - INT TERM EXIT ERR
     local rc=${1:-$?}
+    if [ "${AUTOREMOVE_HOLD_ACTIVE:-false}" = true ]; then
+        apt-mark unhold base-files base-passwd bash coreutils util-linux ${RUNNING_KIMG_HELD:-} >/dev/null 2>&1 || true
+    fi
     sync 2>/dev/null || true
     flock -u 200 2>/dev/null || true
     exec 200>&- 2>/dev/null || true
@@ -538,56 +592,158 @@ safe_run() {
 # Keyring (with signature verification)
 # ────────────────────────────────────────────────────────────────
 
-if $DRY_RUN; then
-    info "DRY-RUN: Would refresh Kali archive keyring from archive.kali.org"
-else
-    info "Refreshing Kali archive keyring..."
-    KEYRING_URL="https://archive.kali.org/archive-keyring.gpg"
+# Download to a temp file. curl -o on the live keyring truncates it when the
+# connection resets, which is worse than keeping the previous keyring.
+refresh_kali_keyring() {
+    local url tmp asc_tmp fetcher=ok
     KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
-    KEYRING_ASC_URL="${KEYRING_URL}.asc"
-    KEYRING_ASC_PATH="${KEYRING_PATH}.asc"
+    local -a urls=(
+        "https://archive.kali.org/archive-keyring.gpg"
+        "https://http.kali.org/kali/archive-keyring.gpg"
+        "https://kali.download/archive-keyring.gpg"
+    )
 
-    if has_cmd curl; then
-        curl -fsSL "$KEYRING_URL" -o "$KEYRING_PATH" || warn "Failed to download keyring"
-        curl -fsSL "$KEYRING_ASC_URL" -o "$KEYRING_ASC_PATH" 2>/dev/null || true
-    elif has_cmd wget; then
-        wget -qO "$KEYRING_PATH" "$KEYRING_URL" || warn "Failed to download keyring"
-        wget -qO "$KEYRING_ASC_PATH" "$KEYRING_ASC_URL" 2>/dev/null || true
-    else
-        warn "curl/wget not available — skipping keyring refresh"
-    fi
-
-    if [ -f "$KEYRING_ASC_PATH" ] && [ -f "$KEYRING_PATH" ]; then
-        if has_cmd gpg; then
-            if gpg --verify "$KEYRING_ASC_PATH" "$KEYRING_PATH" >/dev/null 2>&1; then
-                info "Keyring signature verified successfully"
-            else
-                warn "Keyring signature verification failed — using anyway (may cause issues)"
-            fi
+    info "Refreshing Kali archive keyring..."
+    tmp=$(mktemp)
+    asc_tmp=$(mktemp)
+    for url in "${urls[@]}"; do
+        fetcher=fail
+        if has_cmd curl; then
+            curl -fsSL --retry 2 --retry-delay 2 "$url" -o "$tmp" && fetcher=ok
+        elif has_cmd wget; then
+            wget -qO "$tmp" "$url" && fetcher=ok
         else
-            warn "gpg not installed, skipping signature verification (install gnupg for better security)"
+            warn "curl/wget not available — skipping keyring refresh"
+            rm -f "$tmp" "$asc_tmp"
+            return 0
         fi
-        rm -f "$KEYRING_ASC_PATH"
+        if [ "$fetcher" = ok ] && [ -s "$tmp" ]; then
+            info "Keyring downloaded from $url"
+            install -m 0644 "$tmp" "$KEYRING_PATH"
+            if has_cmd curl; then
+                curl -fsSL --retry 2 --retry-delay 2 "${url}.asc" -o "$asc_tmp" 2>/dev/null || true
+            elif has_cmd wget; then
+                wget -qO "$asc_tmp" "${url}.asc" 2>/dev/null || true
+            fi
+            if [ -s "$asc_tmp" ] && has_cmd gpg; then
+                if gpg --verify "$asc_tmp" "$KEYRING_PATH" >/dev/null 2>&1; then
+                    info "Keyring signature verified successfully"
+                else
+                    warn "Keyring signature verification failed — installed keyring kept"
+                fi
+            elif ! has_cmd gpg; then
+                warn "gpg not installed, skipping signature verification (install gnupg for better security)"
+            fi
+            rm -f "$tmp" "$asc_tmp"
+            return 0
+        fi
+        warn "Keyring download failed: $url"
+    done
+    rm -f "$tmp" "$asc_tmp"
+    warn "Failed to download keyring from every mirror — keeping the installed keyring"
+    if [ ! -s "$KEYRING_PATH" ]; then
+        _record_failure
     fi
-fi
+    return 1
+}
+
+# apt-get update exits 0 when only some indexes fail. Treat a Kali fetch
+# failure as a miss and retry against another mirror for the rest of this run.
+# A mirror that works is written to /etc/apt/sources.list so upgrade uses it too.
+KALI_MIRROR_FALLBACKS=(
+    "https://kali.download/kali"
+    "http://ftp.halifax.rwth-aachen.de/kali"
+    "http://mirror.math.princeton.edu/pub/kali"
+)
+UPGRADE_OK=true
+
+_kali_fetch_failed() {
+    local outfile="$1"
+    grep -E -q 'Failed to fetch https?://[^[:space:]]*kali[^[:space:]]*' "$outfile"
+}
+
+apt_get_update_with_fallback() {
+    local out rc mirror backup
+    out=$(mktemp)
+    rc=0
+    info "Updating package lists..."
+    apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
+    if [ "$rc" -eq 0 ] && ! _kali_fetch_failed "$out"; then
+        rm -f "$out"
+        return 0
+    fi
+
+    warn "Kali package index failed; trying alternate mirrors"
+    if [ ! -f /etc/apt/sources.list ]; then
+        rm -f "$out"
+        _record_failure
+        UPGRADE_OK=false
+        return 1
+    fi
+
+    backup=$(mktemp)
+    cp -a /etc/apt/sources.list "$backup"
+    for mirror in "${KALI_MIRROR_FALLBACKS[@]}"; do
+        if ! grep -E -q 'https?://[^[:space:]]+/kali' "$backup"; then
+            warn "No Kali mirror line in /etc/apt/sources.list; cannot retry"
+            break
+        fi
+        info "Retrying apt-get update via $mirror"
+        sed -E "s#https?://[^[:space:]]+/kali#${mirror}#g" "$backup" > /etc/apt/sources.list
+        : >"$out"
+        rc=0
+        apt-get update 2>&1 | tee -a "$APT_LOG" "$out" || rc=$?
+        if [ "$rc" -eq 0 ] && ! _kali_fetch_failed "$out"; then
+            info "Kali mirror in use for this run: $mirror (written to /etc/apt/sources.list)"
+            rm -f "$out" "$backup"
+            return 0
+        fi
+        warn "Mirror $mirror did not serve the Kali index"
+    done
+
+    cp -a "$backup" /etc/apt/sources.list
+    rm -f "$out" "$backup"
+    warn "apt-get update had issues (see $APT_LOG)"
+    _record_failure
+    UPGRADE_OK=false
+    return 1
+}
+
+# Permanent holds block upgrades (util-linux on hold keeps the whole 2.42
+# stack "kept back"). Drop holds this script used to leave behind. A short
+# hold around autoremove is applied and released later.
+release_legacy_holds() {
+    local pkg
+    info "Releasing holds that block upgrades..."
+    apt-mark unhold base-files base-passwd bash coreutils util-linux 2>/dev/null || true
+    while IFS= read -r pkg; do
+        [ -n "$pkg" ] || continue
+        apt-mark unhold "$pkg" 2>/dev/null || true
+        info "Unheld $pkg"
+    done < <(apt-mark showhold 2>/dev/null | grep -E '^(linux-image|linux-binary)-' || true)
+}
 
 # ────────────────────────────────────────────────────────────────
 # Core update
 # ────────────────────────────────────────────────────────────────
 
 if $DRY_RUN; then
+    info "DRY-RUN: Would refresh Kali archive keyring (with mirror retry)"
+    info "DRY-RUN: Would release legacy apt holds (base-files, bash, util-linux, kernels)"
     info "DRY-RUN: Would run dpkg --configure -a"
     info "DRY-RUN: Would run apt-get install -f"
-    info "DRY-RUN: Would run apt-get update (skipped)"
+    info "DRY-RUN: Would run apt-get update, retrying Kali mirrors on failure"
 else
+    refresh_kali_keyring || true
+    release_legacy_holds
+
     info "Configuring any interrupted package installations..."
     dpkg --configure -a || warn "dpkg --configure -a had issues"
 
     info "Fixing broken dependencies..."
     apt-get install -f -y || warn "apt install -f had issues"
 
-    info "Updating package lists..."
-    apt-get update 2>&1 | tee -a "$APT_LOG" || warn "apt-get update had issues"
+    apt_get_update_with_fallback || true
 fi
 
 info "Checking package cache integrity (apt-get check)..."
@@ -599,43 +755,69 @@ if $DRY_RUN; then
     apt list --upgradable 2>/dev/null | sed -n '1,40p' || true
 else
     info "Upgrading packages..."
-    apt-get upgrade -y 2>&1 | tee -a "$APT_LOG" || warn "apt upgrade had issues (see $APT_LOG)"
+    if ! apt-get upgrade -y 2>&1 | tee -a "$APT_LOG"; then
+        warn "apt upgrade had issues (see $APT_LOG)"
+        _record_failure
+        UPGRADE_OK=false
+    fi
 
     info "Listing upgradable packages after initial upgrade:"
     apt list --upgradable 2>/dev/null || true
 
     info "Performing full system upgrade..."
-    apt-get full-upgrade -y 2>&1 | tee -a "$APT_LOG" || warn "full-upgrade had issues (see $APT_LOG)"
+    if ! apt-get full-upgrade -y 2>&1 | tee -a "$APT_LOG"; then
+        warn "full-upgrade had issues (see $APT_LOG)"
+        _record_failure
+        UPGRADE_OK=false
+    fi
 fi
 
 # ────────────────────────────────────────────────────────────────
 # Complete cleanup
 # ────────────────────────────────────────────────────────────────
 
-if $DRY_RUN; then
-    info "DRY-RUN: Would hold critical packages"
-else
-    info "Holding critical packages to prevent accidental removal..."
-    running_kimg=$(find_running_kernel_pkg "$(uname -r)" || true)
-    if [ -n "$running_kimg" ]; then
-        apt-mark hold base-files base-passwd bash coreutils util-linux "$running_kimg" 2>/dev/null || true
-    else
-        apt-mark hold base-files base-passwd bash coreutils util-linux 2>/dev/null || true
-    fi
-fi
+# Hold only for autoremove, then release. A lasting hold prevents the next
+# upgrade of base-files, bash, and util-linux (and everything tied to them).
+AUTOREMOVE_HOLDS=(base-files base-passwd bash coreutils util-linux)
+release_autoremove_holds() {
+    apt-mark unhold "${AUTOREMOVE_HOLDS[@]}" 2>/dev/null || true
+}
 
 if $DRY_RUN; then
+    info "DRY-RUN: Would hold critical packages only during autoremove, then release them"
     info "DRY-RUN: Would run autoremove, clean, purge configs, kernel removal, etc."
 else
-    info "Removing unnecessary packages (autoremove --purge)..."
-    apt --purge autoremove -y 2>&1 | tee -a "$APT_LOG" || warn "autoremove had issues"
+    running_kimg=$(find_running_kernel_pkg "$(uname -r)" || true)
+    info "Holding critical packages during autoremove..."
+    AUTOREMOVE_HOLD_ACTIVE=true
+    if [ -n "$running_kimg" ]; then
+        RUNNING_KIMG_HELD="$running_kimg"
+        apt-mark hold "${AUTOREMOVE_HOLDS[@]}" "$running_kimg" 2>/dev/null || true
+    else
+        apt-mark hold "${AUTOREMOVE_HOLDS[@]}" 2>/dev/null || true
+    fi
 
-    info "Cleaning package cache (autoclean + clean)..."
-    apt autoclean
-    apt clean
+    info "Removing unnecessary packages (autoremove --purge)..."
+    apt-get --purge autoremove -y 2>&1 | tee -a "$APT_LOG" || warn "autoremove had issues"
+
+    release_autoremove_holds
+    if [ -n "${running_kimg:-}" ]; then
+        apt-mark unhold "$running_kimg" 2>/dev/null || true
+    fi
+    AUTOREMOVE_HOLD_ACTIVE=false
+    info "Critical-package holds released"
+
+    info "Cleaning obsolete package cache (autoclean)..."
+    apt-get autoclean
+    if [ "$UPGRADE_OK" = true ]; then
+        info "Cleaning package cache..."
+        apt-get clean
+    else
+        warn "Skipping apt clean because the upgrade did not finish (keeping downloaded archives for the next run)"
+    fi
 
     info "Purging residual configuration files..."
-    apt purge '~c' -y 2>&1 | tee -a "$APT_LOG" || warn "Purging residual configs had issues"
+    apt-get purge '~c' -y 2>&1 | tee -a "$APT_LOG" || warn "Purging residual configs had issues"
 fi
 
 if $SKIP_KERNEL; then

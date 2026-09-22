@@ -22,7 +22,9 @@ One clean update & cleanup script for Kali Linux.
 - `apt --purge autoremove`
 - `apt autoclean` + `apt clean`
 - Purge residual config files (`apt purge '~c'`)
-- Remove old kernels (keeps running kernel + `KERNEL_KEEP` others; default 2)
+- Remove old kernels (keeps running kernel + `KERNEL_KEEP` others; default 2), including Kali `linux-binary-*` packages
+- If `http.kali.org` fails, retry the Kali index on `kali.download`, then other mirrors, and keep the mirror that works
+- Hold essential packages only during autoremove (a lasting hold blocks their upgrades)
 - Remove old snap revisions
 - Update + remove unused Flatpaks
 - Firmware updates (fwupdmgr)
@@ -35,7 +37,9 @@ One clean update & cleanup script for Kali Linux.
 
 **Other:**
 - Tracks disk usage before/after (across /, /var, /boot)
-- Keeps only the last **3** log files
+- Keeps only the last **3** log files (and their apt-warnings sidecars)
+- Counts a failed package update or upgrade as a failed run
+- Skips `apt clean` when the upgrade did not finish, so downloaded packages can be reused
 - Color output + clear logging
 - Records last run details in /var/lib/kali-update/last-run
 - Safety checks (root, internet, disk space, APT lock)

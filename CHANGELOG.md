@@ -5,6 +5,19 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.15] - 2026-09-22
+
+### Changed
+- `apt-get update`, `upgrade`, and `full-upgrade` failures increment the run failure count. A Kali index miss (including apt's exit 0 with "Failed to fetch") retries `kali.download`, then RWTH Aachen, then Princeton, and keeps the mirror that works in `/etc/apt/sources.list`.
+- `apt clean` runs only after a successful upgrade, so a 503 does not throw away archives already downloaded.
+- Critical packages (`base-files`, `base-passwd`, `bash`, `coreutils`, `util-linux`, running kernel) are held only while `autoremove` runs, then released. Existing holds on those packages and on `linux-image-*` / `linux-binary-*` are cleared at the start of a real run.
+- Log retention deletes matching `*.apt-warnings` files and orphan warning logs.
+
+### Fixed
+- Kernel package match no longer uses a `grep` range that aborts with "Invalid range end".
+- Old-kernel removal understands Kali `linux-binary-VERSION` as well as `linux-image-VERSION`, includes packages in the `hold ok installed` state, and purges both packages for a version that is removed.
+- Keyring refresh downloads to a temporary file and tries more than one URL, so a reset connection cannot truncate the installed keyring.
+
 ## [5.14] - 2026-09-10
 
 ### Added
