@@ -206,6 +206,7 @@ EOF
 chmod 755 "$curl_bin/curl"
 export KALI_UPDATE_CURL_FIXTURE="$ringdir/bad.gpg"
 PATH="$curl_bin:/usr/sbin:/usr/bin:/sbin:/bin"
+KALI_UPDATE_ALLOW_TEST_PATHS=1
 KEYRING_PATH="$installed"
 refresh_kali_keyring || true
 [ "$(cat "$installed")" = "OLD" ] || fail "untrusted download replaced the keyring"
@@ -216,16 +217,28 @@ refresh_kali_keyring || fail "pinned keyring refresh failed"
 cmp -s "$ringdir/test.gpg" "$installed" || fail "pinned keyring was not installed"
 ok "pinned keyring is installed only after the hash and fingerprint checks"
 
+_installed_keyring_usable || fail "pinned installed keyring was not usable"
+KEYRING_PATH="$ringdir/missing-keyring"
+if _installed_keyring_usable; then
+    fail "missing keyring was treated as usable"
+fi
+printf 'not-a-keyring\n' > "$ringdir/bad-installed.gpg"
+KEYRING_PATH="$ringdir/bad-installed.gpg"
+if _installed_keyring_usable; then
+    fail "unpinned keyring was treated as usable"
+fi
+ln -s "$ringdir/test.gpg" "$ringdir/linked.gpg"
+KEYRING_PATH="$ringdir/linked.gpg"
+if _installed_keyring_usable; then
+    fail "symlinked keyring was treated as usable"
+fi
+KEYRING_PATH="$installed"
+ok "missing, unpinned, and symlinked keyrings are not usable"
+
 KALI_KEYRING_SHA256=("${saved_sha[@]}")
 KALI_KEYRING_PRIMARY_FPRS=("${saved_fprs[@]}")
 KALI_KEYRING_REQUIRED_FPR=$saved_required
 _secure_path
-live=$(mktemp "$BASE/live.XXXXXX")
-curl -fsSL --max-time 30 -o "$live" https://archive.kali.org/archive-keyring.gpg || fail "could not download the published keyring"
-if ! _keyring_download_trusted "$live"; then
-    fail "published archive-keyring.gpg does not match the pins in kali-update.sh"
-fi
-ok "published Kali archive keyring matches the script pins"
 
 # --- sources.list restore is atomic and failure is visible ---
 aptdir=$(mktemp -d "$BASE/apt.XXXXXX")
@@ -236,6 +249,7 @@ fallback='deb http://ftp.halifax.rwth-aachen.de/kali kali-rolling main contrib n
 printf '%s\n' "$original" > "$backup"
 printf '%s\n' "$fallback" > "$sources"
 chmod 0644 "$backup" "$sources"
+KALI_UPDATE_ALLOW_TEST_PATHS=1
 KALI_SOURCES_LIST=$sources
 KALI_MIRROR_TEMPORARY=true
 KALI_SOURCES_BACKUP=$backup
@@ -310,5 +324,117 @@ _secure_path
 grep -q 'http://ftp.halifax.rwth-aachen.de/kali' "$sources" || fail "failed interrupt restore changed sources.list"
 [ -f "$backup" ] || fail "interrupt path deleted the backup after a failed restore"
 ok "interrupt path reports failure when sources.list cannot be restored"
+
+# Environment and later assignment cannot redirect root writes unless the
+# sourced-test opt-in is set. This process must not have that opt-in.
+evil_key="$BASE/evil-keyring.gpg"
+evil_sources="$BASE/evil-sources.list"
+printf 'SENTINEL-KEY\n' > "$evil_key"
+printf 'deb https://http.kali.org/kali kali-rolling main\n' > "$evil_sources"
+env KEYRING_PATH="$evil_key" KALI_SOURCES_LIST="$evil_sources" KALI_LOCK_PATH="$BASE/evil.lock" \
+    bash --noprofile --norc -c '
+        export KALI_UPDATE_SOURCE_ONLY=1
+        unset KALI_UPDATE_ALLOW_TEST_PATHS
+        # shellcheck source=/dev/null
+        source "$1"
+        [ "$(_resolve_keyring_path)" = "/usr/share/keyrings/kali-archive-keyring.gpg" ] || exit 1
+        [ "$(_resolve_sources_path)" = "/etc/apt/sources.list" ] || exit 1
+        [ "$(_lock_path)" = "/run/kali-update.lock" ] || exit 1
+        KEYRING_PATH=$2
+        KALI_SOURCES_LIST=$3
+        KALI_LOCK_PATH=$4
+        [ "$(_resolve_keyring_path)" = "/usr/share/keyrings/kali-archive-keyring.gpg" ] || exit 1
+        [ "$(_resolve_sources_path)" = "/etc/apt/sources.list" ] || exit 1
+        [ "$(_lock_path)" = "/run/kali-update.lock" ] || exit 1
+        if _atomic_install_keyring "$5" "$2"; then exit 1; fi
+        if _write_kali_mirror "$6" "https://http.kali.org/kali" "$3"; then exit 1; fi
+    ' bash "$ROOT/kali-update.sh" "$evil_key" "$evil_sources" "$BASE/evil.lock" "$ringdir/test.gpg" "$backup" \
+    || fail "environment was allowed to redirect a root write"
+[ "$(cat "$evil_key")" = "SENTINEL-KEY" ] || fail "KEYRING_PATH write changed the sentinel"
+grep -q 'https://http.kali.org/kali kali-rolling main' "$evil_sources" || fail "KALI_SOURCES_LIST write changed the sentinel"
+ok "environment and later assignment cannot redirect keyring, sources, or lock paths"
+
+# Log file, last-run, and lock refuse symlinks and group-writable directories.
+gw=$(mktemp -d "$BASE/gw.XXXXXX")
+chmod 0775 "$gw"
+if _root_dir_safe "$gw"; then
+    fail "group-writable directory was accepted"
+fi
+if _exclusive_root_file "$gw/fresh.log"; then
+    fail "log file was created in a group-writable directory"
+fi
+[ ! -e "$gw/fresh.log" ] || fail "log file appeared in a group-writable directory"
+if _ensure_root_dir "$gw"; then
+    fail "group-writable directory was reused"
+fi
+ok "group-writable directories are refused"
+
+logd=$(mktemp -d "$BASE/logd.XXXXXX")
+printf 'SECRET\n' > "$BASE/secret-log"
+ln -s "$BASE/secret-log" "$logd/run.log"
+if _exclusive_root_file "$logd/run.log"; then
+    fail "log create followed a symlink"
+fi
+[ "$(cat "$BASE/secret-log")" = "SECRET" ] || fail "log symlink was followed"
+[ -L "$logd/run.log" ] || fail "planted log symlink disappeared"
+_exclusive_root_file "$logd/fresh.log" || fail "exclusive log create failed"
+[ -f "$logd/fresh.log" ] && [ ! -L "$logd/fresh.log" ] || fail "fresh log is not a regular file"
+ok "log create refuses a symlink"
+
+stated=$(mktemp -d "$BASE/stated.XXXXXX")
+printf 'SECRET\n' > "$BASE/secret-last"
+ln -s "$BASE/secret-last" "$stated/last-run"
+if _atomic_write_text "$stated/last-run" <<< 'pwned'; then
+    fail "last-run write followed a symlink"
+fi
+[ "$(cat "$BASE/secret-last")" = "SECRET" ] || fail "last-run symlink was followed"
+[ -L "$stated/last-run" ] || fail "planted last-run symlink disappeared"
+rm -f -- "$stated/last-run"
+printf 'VERSION=test\n' | _atomic_write_text "$stated/last-run" || fail "atomic last-run write failed"
+[ "$(cat "$stated/last-run")" = "VERSION=test" ] || fail "last-run contents were not written"
+[ ! -L "$stated/last-run" ] || fail "last-run record is a symlink"
+[ "$(stat -c %u -- "$stated/last-run")" = 0 ] || fail "last-run is not root-owned"
+ok "last-run write is atomic and refuses a symlink"
+
+lockd=$(mktemp -d "$BASE/lockd.XXXXXX")
+printf 'SECRET\n' > "$BASE/secret-lock"
+ln -s "$BASE/secret-lock" "$lockd/kali-update.lock"
+KALI_UPDATE_ALLOW_TEST_PATHS=1
+KALI_LOCK_PATH="$lockd/kali-update.lock"
+if _acquire_run_lock; then
+    fail "lock open followed a symlink"
+fi
+[ "$(cat "$BASE/secret-lock")" = "SECRET" ] || fail "lock symlink was followed"
+rm -f -- "$lockd/kali-update.lock"
+_acquire_run_lock || fail "lock acquire failed"
+set +e
+(
+    KALI_UPDATE_SOURCE_ONLY=1
+    KALI_UPDATE_ALLOW_TEST_PATHS=1
+    KALI_LOCK_PATH="$lockd/kali-update.lock"
+    _acquire_run_lock
+    rc=$?
+    [ "$rc" -ne 0 ] || exit 2
+    [ "${KALI_LOCK_STATUS:-}" = "busy" ] || exit 3
+)
+lock_rc=$?
+set -e
+_release_run_lock
+[ "$lock_rc" -eq 0 ] || fail "second lock acquire was not busy (rc $lock_rc)"
+ok "lock open refuses a symlink and a second holder"
+
+_secure_path
+live=$(mktemp "$BASE/live.XXXXXX")
+installed_keyring=/usr/share/keyrings/kali-archive-keyring.gpg
+if curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors --max-time 60 -o "$live" https://archive.kali.org/archive-keyring.gpg; then
+    if ! _keyring_download_trusted "$live"; then
+        fail "published archive-keyring.gpg does not match the pins in kali-update.sh"
+    fi
+    ok "published Kali archive keyring matches the script pins"
+elif [ -s "$installed_keyring" ] && _keyring_download_trusted "$installed_keyring"; then
+    ok "installed Kali archive keyring matches the script pins (archive.kali.org was unreachable)"
+else
+    fail "could not download the published keyring and the installed keyring did not match the pins"
+fi
 
 printf '[OK] security regressions passed\n'

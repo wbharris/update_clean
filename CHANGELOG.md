@@ -5,6 +5,15 @@ All notable changes to the Kali Update script will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.18] - 2026-09-23
+
+### Fixed
+- `KEYRING_PATH` and `KALI_SOURCES_LIST` are the system paths `/usr/share/keyrings/kali-archive-keyring.gpg` and `/etc/apt/sources.list`. The environment cannot point those root writes somewhere else. A sourced test can opt in only with `KALI_UPDATE_SOURCE_ONLY=1` and `KALI_UPDATE_ALLOW_TEST_PATHS=1`. A normal run never sets `KALI_UPDATE_SOURCE_ONLY`.
+- `/var/log/kali-update`, each new log file, `/var/lib/kali-update`, and `last-run` are used only when the directory is root-owned, mode `0755` or stricter, and not a symlink. A group-writable directory is refused. Log files are created with an exclusive hard link. `last-run` is written to a temporary file and renamed. A symlink at either name is left in place.
+- The run lock is `/run/kali-update.lock`, opened with `O_NOFOLLOW`, and held with `flock` until the run exits. The lock file is not removed on exit.
+- When the installed Kali keyring is missing, a symlink, or does not match the script pins, the run skips `apt-get update`, `upgrade`, `full-upgrade`, package cleanup, and old-kernel removal.
+- The keyring comment states that the pin is SHA-256, taken from `archive.kali.org/archive-keyring.gpg` on 2026-09-22 and checked against the installed package file. Kali's published checksum for that file is SHA-1 and is not what the script verifies.
+
 ## [5.17] - 2026-09-22
 
 ### Fixed

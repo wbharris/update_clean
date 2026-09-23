@@ -36,6 +36,7 @@ _secure_path() {
     hash -r 2>/dev/null || true
     unset CDPATH || true
     IFS=$' \t\n'
+    umask 022
 }
 _secure_path
 
@@ -586,7 +587,9 @@ show_version() {
 
     # Last run info if available
     local last_file="/var/lib/kali-update/last-run"
-    if [ -f "$last_file" ]; then
+    if [ -L "$last_file" ]; then
+        echo "Last-run record is a symlink; refusing to read it."
+    elif [ -f "$last_file" ]; then
         echo ""
         echo "Last run:"
         cat "$last_file" | sed 's/^/  /'
@@ -595,7 +598,9 @@ show_version() {
 
 show_last_run() {
     local last_file="/var/lib/kali-update/last-run"
-    if [ -f "$last_file" ]; then
+    if [ -L "$last_file" ]; then
+        echo "Last-run record is a symlink; refusing to read it."
+    elif [ -f "$last_file" ]; then
         echo "Last run information:"
         cat "$last_file"
     else
@@ -693,11 +698,15 @@ safe_run() {
 # ────────────────────────────────────────────────────────────────
 
 # Pinned bytes and primary-key fingerprints for archive.kali.org/archive-keyring.gpg
-# as published on 2026-09-22 (SHA-1 603374c107a90a69d983dbcb4d31e0d6eedfc325, the
-# checksum Kali documents). archive-keyring.gpg.asc does not exist (HTTP 404), so
-# a detached signature from the same host is not a trust anchor. A download is
-# installed only when its SHA-256 is pinned and every primary fingerprint is pinned,
-# including the 2025 archive signing key. Update these pins when Kali rotates the keyring.
+# fetched on 2026-09-22. The SHA-256 below is the digest of that file. It matched
+# /usr/share/keyrings/kali-archive-keyring.gpg from the kali-archive-keyring package
+# on the same date. Kali's published checksum for that file is SHA-1
+# 603374c107a90a69d983dbcb4d31e0d6eedfc325; this script does not use SHA-1.
+# archive-keyring.gpg.asc does not exist (HTTP 404), so a detached signature from
+# the same host is not a trust anchor. A download is installed only when its
+# SHA-256 is pinned and every primary fingerprint is pinned, including the 2025
+# archive signing key. When Kali rotates the keyring, update these pins from a
+# fresh download and from the package file, and review the diff before the next run.
 KALI_KEYRING_SHA256=(
     "42a247ff5a26869e3739b6d3ad125938bb5da8e7bb43ed0791d2a190cd09c64f"
 )
@@ -706,7 +715,117 @@ KALI_KEYRING_PRIMARY_FPRS=(
     "44C6513A8E4FB3D30875F758ED444FF07D8D0BF6"
 )
 KALI_KEYRING_REQUIRED_FPR="827C8569F2518CC677FECA1AED65462EC8D5E4C5"
-KEYRING_PATH="${KEYRING_PATH:-/usr/share/keyrings/kali-archive-keyring.gpg}"
+# Fixed destinations. The environment cannot redirect these root writes.
+# A sourced test may opt in with KALI_UPDATE_SOURCE_ONLY=1 and
+# KALI_UPDATE_ALLOW_TEST_PATHS=1. A normal execution never sets SOURCE_ONLY
+# (that flag returns before any write), so the opt-in cannot be used on a real run.
+KALI_KEYRING_CANON="/usr/share/keyrings/kali-archive-keyring.gpg"
+KALI_SOURCES_CANON="/etc/apt/sources.list"
+KEYRING_PATH="$KALI_KEYRING_CANON"
+
+_test_paths_allowed() {
+    [ "${KALI_UPDATE_SOURCE_ONLY:-}" = 1 ] && [ "${KALI_UPDATE_ALLOW_TEST_PATHS:-}" = 1 ]
+}
+
+_resolve_keyring_path() {
+    if _test_paths_allowed; then
+        printf '%s\n' "${KEYRING_PATH:-$KALI_KEYRING_CANON}"
+    else
+        printf '%s\n' "$KALI_KEYRING_CANON"
+    fi
+}
+
+_resolve_sources_path() {
+    if _test_paths_allowed; then
+        printf '%s\n' "${KALI_SOURCES_LIST:-$KALI_SOURCES_CANON}"
+    else
+        printf '%s\n' "$KALI_SOURCES_CANON"
+    fi
+}
+
+# Root-owned directory, not a symlink, not group or world writable.
+_root_dir_safe() {
+    local dir="$1"
+    local owner mode
+    [ -n "$dir" ] || return 1
+    [ "$dir" != "/" ] || return 1
+    [ -L "$dir" ] && return 1
+    [ -d "$dir" ] || return 1
+    owner=$(stat -c %u -- "$dir" 2>/dev/null) || return 1
+    mode=$(stat -c %a -- "$dir" 2>/dev/null) || return 1
+    [ "$owner" = 0 ] || return 1
+    _mode_group_or_world_writable "$mode" && return 1
+    return 0
+}
+
+# Create a missing directory only when its parent is already a safe root directory.
+# An existing directory is used only when it already passes _root_dir_safe.
+# A root-owned group-writable directory is refused rather than chmod'd in place.
+_ensure_root_dir() {
+    local dir="$1"
+    local parent
+    parent=$(dirname -- "$dir")
+    _root_dir_safe "$parent" || return 1
+    if [ -L "$dir" ]; then
+        return 1
+    fi
+    if [ ! -e "$dir" ]; then
+        mkdir -m 0755 -- "$dir" || return 1
+        chown root:root -- "$dir" || return 1
+        chmod 0755 -- "$dir" || return 1
+    fi
+    _root_dir_safe "$dir"
+}
+
+# Write stdin to dest by rename. A symlink at dest is left in place and the write fails.
+_atomic_write_text() {
+    local dest="$1"
+    local dir tmp
+    dir=$(dirname -- "$dest")
+    _ensure_root_dir "$dir" || return 1
+    if [ -L "$dest" ]; then
+        return 1
+    fi
+    if [ -e "$dest" ] && [ ! -f "$dest" ]; then
+        return 1
+    fi
+    if [ -e "$dest" ]; then
+        [ "$(stat -c %u -- "$dest" 2>/dev/null || true)" = 0 ] || return 1
+    fi
+    tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
+    if ! cat > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! chown root:root -- "$tmp" || ! chmod 0644 -- "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -T -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+# New regular file. ln refuses an existing name, including a symlink, and does not follow it.
+_exclusive_root_file() {
+    local dest="$1"
+    local dir tmp
+    dir=$(dirname -- "$dest")
+    _root_dir_safe "$dir" || return 1
+    [ -L "$dest" ] && return 1
+    [ -e "$dest" ] && return 1
+    tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
+    if ! chown root:root -- "$tmp" || ! chmod 0644 -- "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! ln -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    rm -f -- "$tmp"
+}
 
 # Ignore the caller's HOME and GNUPGHOME. gpg.conf there is not trusted.
 _gpg_batch() {
@@ -769,19 +888,21 @@ _keyring_download_trusted() {
 
 _atomic_install_keyring() {
     local src="$1" dest="$2"
-    local dir tmp
+    local dir tmp expected
+    expected=$(_resolve_keyring_path)
+    [ "$dest" = "$expected" ] || return 1
     [ -s "$src" ] || return 1
     [ -L "$src" ] && return 1
     dir=$(dirname -- "$dest")
-    [ -d "$dir" ] || return 1
-    [ -L "$dir" ] && return 1
+    _root_dir_safe "$dir" || return 1
     [ -L "$dest" ] && return 1
     tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
     if ! install -m 0644 -o root -g root -- "$src" "$tmp"; then
         rm -f -- "$tmp"
         return 1
     fi
-    if ! mv -f -- "$tmp" "$dest"; then
+    # -T replaces a symlink raced into place instead of writing through it.
+    if ! mv -T -f -- "$tmp" "$dest"; then
         rm -f -- "$tmp"
         return 1
     fi
@@ -797,7 +918,7 @@ refresh_kali_keyring() {
         "https://kali.download/archive-keyring.gpg"
     )
 
-    [ -n "${KEYRING_PATH:-}" ] || KEYRING_PATH="/usr/share/keyrings/kali-archive-keyring.gpg"
+    KEYRING_PATH=$(_resolve_keyring_path)
     info "Refreshing Kali archive keyring..."
     if ! has_cmd gpg; then
         warn "gpg not installed — refusing to replace the Kali keyring (install gnupg)"
@@ -862,10 +983,21 @@ KALI_MIRROR_HTTP=(
     "http://mirror.math.princeton.edu/pub/kali"
 )
 UPGRADE_OK=true
-KALI_SOURCES_LIST="${KALI_SOURCES_LIST:-/etc/apt/sources.list}"
+KEYRING_USABLE=true
+KALI_SOURCES_LIST="$KALI_SOURCES_CANON"
 KALI_SOURCES_BACKUP=""
 KALI_MIRROR_TEMPORARY=false
 STILL_UPGRADABLE=""
+
+# Installed file matches the same pins as a download, and is not a symlink.
+_installed_keyring_usable() {
+    local path
+    path=$(_resolve_keyring_path)
+    [ -n "$path" ] || return 1
+    [ -L "$path" ] && return 1
+    [ -s "$path" ] || return 1
+    _keyring_download_trusted "$path"
+}
 
 # Same-directory temp file plus rename, so a crash cannot leave a truncated dest.
 # Refuses a symlink at the destination. Copies owner and mode from dest when it exists.
@@ -877,10 +1009,13 @@ _atomic_replace_file() {
     [ -s "$src" ] || return 1
     [ -L "$dest" ] && return 1
     dir=$(dirname -- "$dest")
-    [ -d "$dir" ] || return 1
-    [ -L "$dir" ] && return 1
+    _root_dir_safe "$dir" || return 1
     tmp=$(mktemp "$dir/.$(basename -- "$dest").XXXXXX") || return 1
     if ! cp -a -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! chown root:root -- "$tmp"; then
         rm -f -- "$tmp"
         return 1
     fi
@@ -892,7 +1027,7 @@ _atomic_replace_file() {
     else
         chmod 0644 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
     fi
-    if ! mv -f -- "$tmp" "$dest"; then
+    if ! mv -T -f -- "$tmp" "$dest"; then
         rm -f -- "$tmp"
         return 1
     fi
@@ -911,7 +1046,9 @@ _kali_sources_ok() {
 
 _write_kali_mirror() {
     local backup="$1" mirror="$2" dest="$3"
-    local tmp
+    local tmp expected
+    expected=$(_resolve_sources_path)
+    [ "$dest" = "$expected" ] || return 1
     [[ "$mirror" =~ ^https?://[A-Za-z0-9._~:/?#@%+-]+/kali$ ]] || return 1
     tmp=$(mktemp "$(dirname -- "$dest")/.sources.list.new.XXXXXX") || return 1
     if ! sed -E "s#https?://[^[:space:]]+/kali#${mirror}#g" "$backup" > "$tmp"; then
@@ -934,6 +1071,7 @@ _write_kali_mirror() {
 # the run is a failure so an HTTP mirror is not reported as a clean exit.
 restore_temporary_kali_sources() {
     local backup
+    KALI_SOURCES_LIST=$(_resolve_sources_path)
     [ "${KALI_MIRROR_TEMPORARY:-false}" = true ] || return 0
     backup="${KALI_SOURCES_BACKUP:-}"
     if [ -z "$backup" ] || [ ! -f "$backup" ] || [ -L "$backup" ]; then
@@ -971,12 +1109,91 @@ cleanup() {
         fi
     fi
     sync 2>/dev/null || true
-    if [ -n "${LOCKFILE:-}" ]; then
-        flock -u 200 2>/dev/null || true
-        exec 200>&- 2>/dev/null || true
-        rm -f -- "$LOCKFILE" 2>/dev/null || true
-    fi
+    _release_run_lock
     exit "$rc"
+}
+
+# Opened with O_NOFOLLOW and held with flock for the life of the run.
+# The lock file is left in place so exit does not unlink a name an attacker
+# could recreate.
+_lock_path() {
+    if _test_paths_allowed; then
+        printf '%s\n' "${KALI_LOCK_PATH:-/run/kali-update.lock}"
+    else
+        printf '%s\n' /run/kali-update.lock
+    fi
+}
+
+_release_run_lock() {
+    if [ -n "${KALI_LOCK_PID:-}" ]; then
+        kill "$KALI_LOCK_PID" 2>/dev/null || true
+        wait "$KALI_LOCK_PID" 2>/dev/null || true
+        KALI_LOCK_PID=""
+    fi
+}
+
+_acquire_run_lock() {
+    local path dir reply hold status
+    path=$(_lock_path)
+    dir=$(dirname -- "$path")
+    _root_dir_safe "$dir" || return 1
+    [ -L "$path" ] && return 1
+    reply=$(mktemp "$dir/.kali-lock.XXXXXX") || return 1
+    rm -f -- "$reply"
+    mkfifo -m 0600 -- "$reply" || return 1
+    # The holder opens the lock with O_NOFOLLOW, takes flock, then replaces
+    # itself with sleep. prctl(PR_SET_PDEATHSIG) makes that sleep exit when
+    # this shell exits, including after SIGKILL, so a crashed run cannot
+    # leave the lock held.
+    python3 - "$path" "$reply" << 'PY' &
+import ctypes, errno, fcntl, os, stat, sys
+path, reply = sys.argv[1:]
+flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+try:
+    fd = os.open(path, flags, 0o644)
+except OSError as exc:
+    kind = "symlink" if exc.errno == errno.ELOOP else "error"
+    with open(reply, "w", encoding="ascii") as out:
+        out.write(kind + "\n")
+    sys.exit(1)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("not a regular file")
+    os.fchown(fd, 0, 0)
+    os.fchmod(fd, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    with open(reply, "w", encoding="ascii") as out:
+        out.write("busy\n")
+    sys.exit(1)
+os.set_inheritable(fd, True)
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+# 15 is SIGTERM. Delivered when the parent shell exits.
+if libc.prctl(1, 15, 0, 0, 0) != 0:
+    with open(reply, "w", encoding="ascii") as out:
+        out.write("error\n")
+    sys.exit(1)
+with open(reply, "w", encoding="ascii") as out:
+    out.write("ok\n")
+os.execv("/bin/sleep", ["sleep", "infinity"])
+PY
+    KALI_LOCK_PID=$!
+    status=error
+    if IFS= read -r -t 5 status < "$reply"; then
+        :
+    else
+        status=error
+    fi
+    rm -f -- "$reply"
+    KALI_LOCK_STATUS=$status
+    if [ "$status" != "ok" ]; then
+        kill "$KALI_LOCK_PID" 2>/dev/null || true
+        wait "$KALI_LOCK_PID" 2>/dev/null || true
+        KALI_LOCK_PID=""
+        return 1
+    fi
+    LOCKFILE="$path"
 }
 
 _kali_fetch_failed() {
@@ -1002,6 +1219,7 @@ apt_get_update_with_fallback() {
     local out rc mirror backup current
     local -a order=()
 
+    KALI_SOURCES_LIST=$(_resolve_sources_path)
     out=$(mktemp)
     if [ -L "$KALI_SOURCES_LIST" ]; then
         rm -f "$out"
@@ -1162,6 +1380,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$EUID" -ne 0 ]; then
+    error "This script must be run as root (use sudo)."
+    exit 1
+fi
+
 if $DRY_RUN; then
     info "DRY RUN MODE ENABLED - No changes will be made"
     info "DRY-RUN skips keyring refresh, apt-get update, and destructive steps"
@@ -1174,8 +1397,14 @@ LOG_DIR="/var/log/kali-update"
 LOG_FILE="$LOG_DIR/kali-update-$(date +%Y%m%d-%H%M%S).log"
 APT_LOG="$LOG_FILE.apt-warnings"
 
-mkdir -p "$LOG_DIR"
-chmod 755 "$LOG_DIR"
+if ! _ensure_root_dir "$LOG_DIR"; then
+    error "Refusing to log under $LOG_DIR (must be a root-owned directory, mode 755 or stricter, not a symlink)"
+    exit 1
+fi
+if ! _exclusive_root_file "$LOG_FILE" || ! _exclusive_root_file "$APT_LOG"; then
+    error "Refusing to create $LOG_FILE (destination exists or is a symlink)"
+    exit 1
+fi
 
 exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
@@ -1183,17 +1412,32 @@ log "Running kali-update version: $VERSION"
 
 # Keep the last N main logs and the matching apt-warnings sidecars.
 # Orphan *.apt-warnings (main log already gone) are removed too.
+# Only regular root-owned files directly inside the log directory are removed.
 log "Cleaning up old logs (keeping last $LOG_RETENTION)..."
 while IFS= read -r oldlog; do
     [ -n "$oldlog" ] || continue
-    rm -f "$oldlog" "${oldlog}.apt-warnings"
+    case "$oldlog" in
+        "$LOG_DIR"/kali-update-*.log) ;;
+        *) continue ;;
+    esac
+    [ -L "$oldlog" ] && continue
+    [ -f "$oldlog" ] || continue
+    [ "$(stat -c %u -- "$oldlog" 2>/dev/null || true)" = 0 ] || continue
+    rm -f -- "$oldlog"
+    side="${oldlog}.apt-warnings"
+    if [ -L "$side" ]; then
+        warn "Refusing to remove symlinked $side"
+    elif [ -f "$side" ] && [ "$(stat -c %u -- "$side" 2>/dev/null || true)" = 0 ]; then
+        rm -f -- "$side"
+    fi
 done < <(
-    find "$LOG_DIR" -name 'kali-update-*.log' -type f -printf '%T@ %p\n' \
+    find -P "$LOG_DIR" -maxdepth 1 -name 'kali-update-*.log' -type f -printf '%T@ %p\n' \
         | sort -n | head -n "-${LOG_RETENTION}" | cut -d' ' -f2-
 )
 for sidecar in "$LOG_DIR"/kali-update-*.log.apt-warnings; do
     [ -e "$sidecar" ] || continue
-    [ -f "${sidecar%.apt-warnings}" ] || rm -f "$sidecar"
+    [ -L "$sidecar" ] && continue
+    [ -f "${sidecar%.apt-warnings}" ] || rm -f -- "$sidecar"
 done
 
 SCRIPT_START=$(date +%s)
@@ -1210,11 +1454,6 @@ export APT_LISTCHANGES_FRONTEND=none
 # ────────────────────────────────────────────────────────────────
 # Pre-flight checks
 # ────────────────────────────────────────────────────────────────
-
-if [ "$EUID" -ne 0 ]; then
-    error "This script must be run as root (use sudo)."
-    exit 1
-fi
 
 # Improved connectivity check (Kali archive first)
 info "Checking internet connectivity..."
@@ -1267,10 +1506,12 @@ BEFORE=$(df / /var /boot --output=used 2>/dev/null | awk 'NR>1 {s+=$1} END {prin
 # ────────────────────────────────────────────────────────────────
 # Simple file lock + trap
 # ────────────────────────────────────────────────────────────────
-LOCKFILE="/var/run/kali-update.lock"
-exec 200>"$LOCKFILE"
-if ! flock -n 200; then
-    error "Another instance of kali-update is already running."
+if ! _acquire_run_lock; then
+    if [ "${KALI_LOCK_STATUS:-}" = "busy" ]; then
+        error "Another instance of kali-update is already running."
+    else
+        error "Refusing to lock /run/kali-update.lock (unsafe path or symlink)"
+    fi
     exit 1
 fi
 
@@ -1289,15 +1530,25 @@ if $DRY_RUN; then
     info "DRY-RUN: Would run apt-get update, preferring an HTTPS Kali mirror; HTTP mirrors are not saved"
 else
     refresh_kali_keyring || true
-    release_legacy_holds
+    if ! _installed_keyring_usable; then
+        error "No usable Kali archive keyring is available; refusing to update"
+        _record_failure
+        UPGRADE_OK=false
+        KEYRING_USABLE=false
+    fi
+    if [ "$KEYRING_USABLE" = true ]; then
+        release_legacy_holds
 
-    info "Configuring any interrupted package installations..."
-    dpkg --configure -a || warn "dpkg --configure -a had issues"
+        info "Configuring any interrupted package installations..."
+        dpkg --configure -a || warn "dpkg --configure -a had issues"
 
-    info "Fixing broken dependencies..."
-    apt-get install -f -y || warn "apt install -f had issues"
+        info "Fixing broken dependencies..."
+        apt-get install -f -y || warn "apt install -f had issues"
 
-    apt_get_update_with_fallback || true
+        apt_get_update_with_fallback || true
+    else
+        warn "Skipping apt-get update and package upgrades until a pinned Kali keyring is installed"
+    fi
 fi
 
 info "Checking package cache integrity (apt-get check)..."
@@ -1307,6 +1558,8 @@ if $DRY_RUN; then
     info "DRY-RUN: Would run apt-get upgrade"
     info "DRY-RUN: Would run apt-get full-upgrade"
     apt list --upgradable 2>/dev/null | sed -n '1,40p' || true
+elif [ "$KEYRING_USABLE" = false ]; then
+    warn "Skipping apt-get upgrade and full-upgrade because the Kali archive keyring is not usable"
 else
     info "Upgrading packages..."
     if ! apt-get upgrade -y 2>&1 | tee -a "$APT_LOG"; then
@@ -1342,6 +1595,8 @@ release_autoremove_holds() {
 if $DRY_RUN; then
     info "DRY-RUN: Would hold critical packages only during autoremove, then release them"
     info "DRY-RUN: Would run autoremove, clean, purge configs, kernel removal, etc."
+elif [ "$KEYRING_USABLE" = false ]; then
+    warn "Skipping package cleanup because the Kali archive keyring is not usable"
 else
     running_kimg=$(find_running_kernel_pkg "$(uname -r)" || true)
     info "Holding critical packages during autoremove..."
@@ -1378,6 +1633,8 @@ fi
 
 if $SKIP_KERNEL; then
     info "Skipping old kernel removal (--no-kernel)."
+elif [ "$KEYRING_USABLE" = false ]; then
+    warn "Skipping old kernel removal because the Kali archive keyring is not usable"
 else
     remove_old_kernels
 fi
@@ -1487,10 +1744,9 @@ LAST_RUN_DIR="/var/lib/kali-update"
 LAST_RUN_FILE="$LAST_RUN_DIR/last-run"
 
 if ! $DRY_RUN; then
-    mkdir -p "$LAST_RUN_DIR"
     RUN_STATUS=success
     [ "$EXIT_CODE" -ne 0 ] && RUN_STATUS=failure
-    cat > "$LAST_RUN_FILE" << LAST
+    if _atomic_write_text "$LAST_RUN_FILE" << LAST
 VERSION=$VERSION
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 STATUS=$RUN_STATUS
@@ -1499,7 +1755,12 @@ DISK_FREED_MB=$FREED_MB
 REBOOT_REQUIRED=$([ "$REBOOT_DURING_RUN" = true ] && echo "yes" || echo "no")
 LOG_FILE=$LOG_FILE
 LAST
-    info "Last run record written to $LAST_RUN_FILE"
+    then
+        info "Last run record written to $LAST_RUN_FILE"
+    else
+        error "Refusing to write $LAST_RUN_FILE (directory or file is unsafe)"
+        _record_failure
+    fi
 else
     info "DRY-RUN: Would write last-run record"
 fi

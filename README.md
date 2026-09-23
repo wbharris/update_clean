@@ -88,6 +88,8 @@ Variables:
 ### Safety
 
 - Must run as root.
+- The archive keyring path and `sources.list` path are fixed. The environment cannot redirect them.
+- A run with no pinned Kali archive keyring skips package updates.
 - Requires at least 2GB free disk space.
 - Keeps running kernel plus `KERNEL_KEEP` additional kernels (default: 2).
 - `--dry-run` skips state-changing steps (keyring, apt update, holds, purges).
